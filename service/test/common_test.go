@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/derekparker/delve/service/api"
+	"github.com/go-delve/delve/service/api"
 )
 
 func assertNoError(err error, t *testing.T, s string) {
@@ -52,6 +52,10 @@ func testProgPath(t *testing.T, name string) string {
 			t.Fatal(err)
 		}
 	}
+	sympath, err := filepath.EvalSymlinks(fp)
+	if err == nil {
+		fp = strings.Replace(sympath, "\\", "/", -1)
+	}
 	return fp
 }
 
@@ -71,12 +75,27 @@ func countBreakpoints(t *testing.T, c BreakpointLister) int {
 	return bpcount
 }
 
-type LocationFinder interface {
+type locationFinder1 interface {
 	FindLocation(api.EvalScope, string) ([]api.Location, error)
 }
 
-func findLocationHelper(t *testing.T, c LocationFinder, loc string, shouldErr bool, count int, checkAddr uint64) []uint64 {
-	locs, err := c.FindLocation(api.EvalScope{-1, 0}, loc)
+type locationFinder2 interface {
+	FindLocation(api.EvalScope, string, bool) ([]api.Location, error)
+}
+
+func findLocationHelper(t *testing.T, c interface{}, loc string, shouldErr bool, count int, checkAddr uint64) []uint64 {
+	var locs []api.Location
+	var err error
+
+	switch c := c.(type) {
+	case locationFinder1:
+		locs, err = c.FindLocation(api.EvalScope{-1, 0, 0}, loc)
+	case locationFinder2:
+		locs, err = c.FindLocation(api.EvalScope{-1, 0, 0}, loc, false)
+	default:
+		t.Errorf("unexpected type %T passed to findLocationHelper", c)
+	}
+
 	t.Logf("FindLocation(\"%s\") → %v\n", loc, locs)
 
 	if shouldErr {
@@ -94,7 +113,7 @@ func findLocationHelper(t *testing.T, c LocationFinder, loc string, shouldErr bo
 	}
 
 	if checkAddr != 0 && checkAddr != locs[0].PC {
-		t.Fatalf("Wrong address returned for location <%s> (got %#x, epected %#x)", loc, locs[0].PC, checkAddr)
+		t.Fatalf("Wrong address returned for location <%s> (got %#x, expected %#x)", loc, locs[0].PC, checkAddr)
 	}
 
 	addrs := make([]uint64, len(locs))

@@ -5,6 +5,7 @@ Command | Description
 [args](#args) | Print function arguments.
 [break](#break) | Sets a breakpoint.
 [breakpoints](#breakpoints) | Print out info for active breakpoints.
+[call](#call) | Resumes process, injecting a function call (EXPERIMENTAL!!!)
 [check](#check) | Creates a checkpoint at the current position.
 [checkpoints](#checkpoints) | Print out info for existing checkpoints.
 [clear](#clear) | Deletes breakpoint.
@@ -13,13 +14,17 @@ Command | Description
 [condition](#condition) | Set breakpoint condition.
 [config](#config) | Changes configuration parameters.
 [continue](#continue) | Run until breakpoint or program termination.
+[deferred](#deferred) | Executes command in the context of a deferred call.
 [disassemble](#disassemble) | Disassembler.
+[down](#down) | Move the current frame down.
+[edit](#edit) | Open where you are in $DELVE_EDITOR or $EDITOR
 [exit](#exit) | Exit the debugger.
-[frame](#frame) | Executes command on a different frame.
+[frame](#frame) | Set the current frame, or execute command on a different frame.
 [funcs](#funcs) | Print list of functions.
 [goroutine](#goroutine) | Shows or changes current goroutine
 [goroutines](#goroutines) | List program goroutines.
 [help](#help) | Prints the help message.
+[libraries](#libraries) | List loaded dynamic libraries
 [list](#list) | Show source code.
 [locals](#locals) | Print local variables.
 [next](#next) | Step over to next source line.
@@ -27,6 +32,7 @@ Command | Description
 [print](#print) | Evaluate an expression.
 [regs](#regs) | Print contents of CPU registers.
 [restart](#restart) | Restart process from a checkpoint or event.
+[rev](#rev) | Reverses the execution of the target program for the command specified.
 [rewind](#rewind) | Run backwards until breakpoint or program termination.
 [set](#set) | Changes the value of a variable.
 [source](#source) | Executes a file containing a list of delve commands
@@ -39,6 +45,7 @@ Command | Description
 [threads](#threads) | Print out info for every traced thread.
 [trace](#trace) | Set tracepoint.
 [types](#types) | Print list of types
+[up](#up) | Move the current frame up.
 [vars](#vars) | Print package variables.
 [whatis](#whatis) | Prints type of an expression.
 
@@ -55,7 +62,7 @@ Sets a breakpoint.
 
 	break [name] <linespec>
 
-See [Documentation/cli/locspec.md](//github.com/derekparker/delve/tree/master/Documentation/cli/locspec.md) for the syntax of linespec.
+See [Documentation/cli/locspec.md](//github.com/go-delve/delve/tree/master/Documentation/cli/locspec.md) for the syntax of linespec.
 
 See also: "help on", "help cond" and "help clear"
 
@@ -66,10 +73,31 @@ Print out info for active breakpoints.
 
 Aliases: bp
 
+## call
+Resumes process, injecting a function call (EXPERIMENTAL!!!)
+	
+	call [-unsafe] <function call expression>
+	
+Current limitations:
+- only pointers to stack-allocated objects can be passed as argument.
+- only some automatic type conversions are supported.
+- functions can only be called on running goroutines that are not
+  executing the runtime.
+- the current goroutine needs to have at least 256 bytes of free space on
+  the stack.
+- functions can only be called when the goroutine is stopped at a safe
+  point.
+- calling a function will resume execution of all goroutines.
+- only supported on linux's native backend.
+
+
+
 ## check
 Creates a checkpoint at the current position.
-			
-	checkpoint [where]
+
+	checkpoint [note]
+
+The "note" is arbitrary text that can be used to identify the checkpoint, if it is not specified it defaults to the current filename:line position.
 
 Aliases: checkpoint
 
@@ -85,7 +113,7 @@ Deletes breakpoint.
 
 ## clear-checkpoint
 Deletes checkpoint.
-			
+
 	clear-checkpoint <id>
 
 Aliases: clearcheck
@@ -94,7 +122,7 @@ Aliases: clearcheck
 Deletes multiple breakpoints.
 
 	clearall [<linespec>]
-	
+
 If called with the linespec argument it will delete all the breakpoints matching the linespec. If linespec is omitted all breakpoints are deleted.
 
 
@@ -102,16 +130,16 @@ If called with the linespec argument it will delete all the breakpoints matching
 Set breakpoint condition.
 
 	condition <breakpoint name or id> <boolean expression>.
-	
+
 Specifies that the breakpoint or tracepoint should break only if the boolean expression is true.
 
 Aliases: cond
 
 ## config
 Changes configuration parameters.
-		
+
 	config -list
-	
+
 Show all configuration parameters.
 
 	config -save
@@ -119,17 +147,17 @@ Show all configuration parameters.
 Saves the configuration file to disk, overwriting the current configuration file.
 
 	config <parameter> <value>
-	
+
 Changes the value of a configuration parameter.
 
-	config subistitute-path <from> <to>
-	config subistitute-path <from>
-	
-Adds or removes a path subistitution rule.
+	config substitute-path <from> <to>
+	config substitute-path <from>
+
+Adds or removes a path substitution rule.
 
 	config alias <command> <alias>
 	config alias <alias>
-	
+
 Defines <alias> as an alias to <command> or removes an alias.
 
 
@@ -138,27 +166,61 @@ Run until breakpoint or program termination.
 
 Aliases: c
 
+## deferred
+Executes command in the context of a deferred call.
+
+	deferred <n> <command>
+
+Executes the specified command (print, args, locals) in the context of the n-th deferred call in the current frame.
+
+
 ## disassemble
 Disassembler.
 
 	[goroutine <n>] [frame <m>] disassemble [-a <start> <end>] [-l <locspec>]
 
 If no argument is specified the function being executed in the selected stack frame will be executed.
-	
+
 	-a <start> <end>	disassembles the specified address range
 	-l <locspec>		disassembles the specified function
 
 Aliases: disass
 
+## down
+Move the current frame down.
+
+	down [<m>]
+	down [<m>] <command>
+
+Move the current frame down by <m>. The second form runs the command on the given frame.
+
+
+## edit
+Open where you are in $DELVE_EDITOR or $EDITOR
+
+	edit [locspec]
+	
+If locspec is omitted edit will open the current source file in the editor, otherwise it will open the specified location.
+
+Aliases: ed
+
 ## exit
 Exit the debugger.
+		
+	exit [-c]
+	
+When connected to a headless instance started with the --accept-multiclient, pass -c to resume the execution of the target process before disconnecting.
 
 Aliases: quit q
 
 ## frame
-Executes command on a different frame.
+Set the current frame, or execute command on a different frame.
 
-	frame <frame index> <command>.
+	frame <m>
+	frame <m> <command>
+
+The first form sets frame used by subsequent commands such as "print" or "set".
+The second form runs the command on the given frame.
 
 
 ## funcs
@@ -180,29 +242,37 @@ Called without arguments it will show information about the current goroutine.
 Called with a single argument it will switch to the specified goroutine.
 Called with more arguments it will execute a command on the specified goroutine.
 
+Aliases: gr
 
 ## goroutines
 List program goroutines.
 
-	goroutines [-u (default: user location)|-r (runtime location)|-g (go statement location)]
+	goroutines [-u (default: user location)|-r (runtime location)|-g (go statement location)|-s (start location)] [ -t (stack trace)]
 
 Print out info for every goroutine. The flag controls what information is shown along with each goroutine:
 
 	-u	displays location of topmost stackframe in user code
 	-r	displays location of topmost stackframe (including frames inside private runtime functions)
 	-g	displays location of go instruction that created the goroutine
-	
+	-s	displays location of the start function
+	-t	displays stack trace of goroutine
+
 If no flag is specified the default is -u.
 
+Aliases: grs
 
 ## help
 Prints the help message.
 
 	help [command]
-	
+
 Type "help" followed by the name of a command for more information about it.
 
 Aliases: h
+
+## libraries
+List loaded dynamic libraries
+
 
 ## list
 Show source code.
@@ -211,7 +281,7 @@ Show source code.
 
 Show source around current point or provided linespec.
 
-Aliases: ls
+Aliases: ls l
 
 ## locals
 Print local variables.
@@ -226,13 +296,18 @@ If regex is specified only local variables with a name matching it will be retur
 ## next
 Step over to next source line.
 
+	 next [count]
+
+Optional [count] argument allows you to skip multiple lines.
+
+
 Aliases: n
 
 ## on
 Executes a command when a breakpoint is hit.
 
 	on <breakpoint name or id> <command>.
-	
+
 Supported commands: print, stack and goroutine)
 
 
@@ -241,7 +316,7 @@ Evaluate an expression.
 
 	[goroutine <n>] [frame <m>] print <expression>
 
-See [Documentation/cli/expr.md](//github.com/derekparker/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions.
+See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions.
 
 Aliases: p
 
@@ -249,16 +324,21 @@ Aliases: p
 Print contents of CPU registers.
 
 	regs [-a]
-	
+
 Argument -a shows more registers.
 
 
 ## restart
 Restart process from a checkpoint or event.
-	
-	restart [event number or checkpoint id]
+
+  restart [event number or checkpoint id]
 
 Aliases: r
+
+## rev
+Reverses the execution of the target program for the command specified.
+Currently, only the rev step-instruction command is supported.
+
 
 ## rewind
 Run backwards until breakpoint or program termination.
@@ -270,13 +350,17 @@ Changes the value of a variable.
 
 	[goroutine <n>] [frame <m>] set <variable> = <value>
 
-See [Documentation/cli/expr.md](//github.com/derekparker/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions. Only numerical variables and pointers can be changed.
+See [Documentation/cli/expr.md](//github.com/go-delve/delve/tree/master/Documentation/cli/expr.md) for a description of supported expressions. Only numerical variables and pointers can be changed.
 
 
 ## source
 Executes a file containing a list of delve commands
 
 	source <path>
+	
+If path ends with the .star extension it will be interpreted as a starlark script. See [Documentation/cli/starlark.md](//github.com/go-delve/delve/tree/master/Documentation/cli/starlark.md) for the syntax.
+
+If path is a single '-' character an interactive starlark interpreter will start instead. Type 'exit' to exit.
 
 
 ## sources
@@ -290,9 +374,18 @@ If regex is specified only the source files matching it will be returned.
 ## stack
 Print stack trace.
 
-	[goroutine <n>] [frame <m>] stack [<depth>] [-full]
+	[goroutine <n>] [frame <m>] stack [<depth>] [-full] [-offsets] [-defer] [-a <n>] [-adepth <depth>] [-mode <mode>]
 
-If -full is specified every stackframe will be decorated by the value of its local variables and function arguments.
+	-full		every stackframe is decorated with the value of its local variables and arguments.
+	-offsets	prints frame offset of each frame.
+	-defer		prints deferred function call stack for each frame.
+	-a <n>		prints stacktrace of n ancestors of the selected goroutine (target process must have tracebackancestors enabled)
+	-adepth <depth>	configures depth of ancestor stacktrace
+	-mode <mode>	specifies the stacktrace mode, possible values are:
+			normal	- attempts to automatically switch between cgo frames and go frames
+			simple	- disables automatic switch between cgo and go
+			fromg	- starts from the registers stored in the runtime.g struct
+
 
 Aliases: bt
 
@@ -309,6 +402,7 @@ Aliases: si
 ## stepout
 Step out of the current function.
 
+Aliases: so
 
 ## thread
 Switch to the specified thread.
@@ -325,8 +419,8 @@ Print out info for every traced thread.
 Set tracepoint.
 
 	trace [name] <linespec>
-	
-A tracepoint is a breakpoint that does not stop the execution of the program, instead when the tracepoint is hit a notification is displayed. See [Documentation/cli/locspec.md](//github.com/derekparker/delve/tree/master/Documentation/cli/locspec.md) for the syntax of linespec.
+
+A tracepoint is a breakpoint that does not stop the execution of the program, instead when the tracepoint is hit a notification is displayed. See [Documentation/cli/locspec.md](//github.com/go-delve/delve/tree/master/Documentation/cli/locspec.md) for the syntax of linespec.
 
 See also: "help on", "help cond" and "help clear"
 
@@ -340,6 +434,15 @@ Print list of types
 If regex is specified only the types matching it will be returned.
 
 
+## up
+Move the current frame up.
+
+	up [<m>]
+	up [<m>] <command>
+
+Move the current frame up by <m>. The second form runs the command on the given frame.
+
+
 ## vars
 Print package variables.
 
@@ -350,7 +453,7 @@ If regex is specified only package variables with a name matching it will be ret
 
 ## whatis
 Prints type of an expression.
-		
-		whatis <expression>.
+
+	whatis <expression>
 
 

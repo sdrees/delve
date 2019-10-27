@@ -3,7 +3,7 @@ package service
 import (
 	"time"
 
-	"github.com/derekparker/delve/service/api"
+	"github.com/go-delve/delve/service/api"
 )
 
 // Client represents a debugger service client. All client methods are
@@ -21,10 +21,12 @@ type Client interface {
 	// Restarts program.
 	Restart() ([]api.DiscardedBreakpoint, error)
 	// Restarts program from the specified position.
-	RestartFrom(pos string) ([]api.DiscardedBreakpoint, error)
+	RestartFrom(rerecord bool, pos string, resetArgs bool, newArgs []string) ([]api.DiscardedBreakpoint, error)
 
 	// GetState returns the current debugger state.
 	GetState() (*api.DebuggerState, error)
+	// GetStateNonBlocking returns the current debugger state, returning immediately if the target is already running.
+	GetStateNonBlocking() (*api.DebuggerState, error)
 
 	// Continue resumes process execution.
 	Continue() <-chan *api.DebuggerState
@@ -36,9 +38,13 @@ type Client interface {
 	Step() (*api.DebuggerState, error)
 	// StepOut continues to the return address of the current function
 	StepOut() (*api.DebuggerState, error)
+	// Call resumes process execution while making a function call.
+	Call(goroutineID int, expr string, unsafe bool) (*api.DebuggerState, error)
 
 	// SingleStep will step a single cpu instruction.
 	StepInstruction() (*api.DebuggerState, error)
+	// ReverseSingleStep will reverse step a single cpu instruction.
+	ReverseStepInstruction() (*api.DebuggerState, error)
 	// SwitchThread switches the current thread context.
 	SwitchThread(threadID int) (*api.DebuggerState, error)
 	// SwitchGoroutine switches the current goroutine (and the current thread as well)
@@ -91,10 +97,13 @@ type Client interface {
 	ListRegisters(threadID int, includeFp bool) (api.Registers, error)
 
 	// ListGoroutines lists all goroutines.
-	ListGoroutines() ([]*api.Goroutine, error)
+	ListGoroutines(start, count int) ([]*api.Goroutine, int, error)
 
 	// Returns stacktrace
-	Stacktrace(int, int, *api.LoadConfig) ([]api.Stackframe, error)
+	Stacktrace(goroutineID int, depth int, opts api.StacktraceOptions, cfg *api.LoadConfig) ([]api.Stackframe, error)
+
+	// Returns ancestor stacktraces
+	Ancestors(goroutineID int, numAncestors int, depth int) ([]api.Ancestor, error)
 
 	// Returns whether we attached to a running process or not
 	AttachedToExistingProcess() bool
@@ -110,7 +119,8 @@ type Client interface {
 	// * <line> returns a location for a line in the current file
 	// * *<address> returns the location corresponding to the specified address
 	// NOTE: this function does not actually set breakpoints.
-	FindLocation(scope api.EvalScope, loc string) ([]api.Location, error)
+	// If findInstruction is true FindLocation will only return locations that correspond to instructions.
+	FindLocation(scope api.EvalScope, loc string, findInstruction bool) ([]api.Location, error)
 
 	// Disassemble code between startPC and endPC
 	DisassembleRange(scope api.EvalScope, startPC, endPC uint64, flavour api.AssemblyFlavour) (api.AsmInstructions, error)
@@ -127,4 +137,20 @@ type Client interface {
 	ListCheckpoints() ([]api.Checkpoint, error)
 	// ClearCheckpoint removes a checkpoint
 	ClearCheckpoint(id int) error
+
+	// SetReturnValuesLoadConfig sets the load configuration for return values.
+	SetReturnValuesLoadConfig(*api.LoadConfig)
+
+	// IsMulticlien returns true if the headless instance is multiclient.
+	IsMulticlient() bool
+
+	// ListDynamicLibraries returns a list of loaded dynamic libraries.
+	ListDynamicLibraries() ([]api.Image, error)
+
+	// Disconnect closes the connection to the server without sending a Detach request first.
+	// If cont is true a continue command will be sent instead.
+	Disconnect(cont bool) error
+
+	// CallAPI allows calling an arbitrary rpc method (used by starlark bindings)
+	CallAPI(method string, args, reply interface{}) error
 }

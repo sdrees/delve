@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/derekparker/delve/pkg/proc"
-	protest "github.com/derekparker/delve/pkg/proc/test"
+	"github.com/go-delve/delve/pkg/proc"
+	protest "github.com/go-delve/delve/pkg/proc/test"
 )
 
 type errIssue419 struct {
@@ -36,8 +36,7 @@ func TestIssue419(t *testing.T) {
 	// SIGINT directed at the inferior should be passed along not swallowed by delve
 	withTestProcess("issue419", t, func(p proc.Process, fixture protest.Fixture) {
 		defer close(errChan)
-		_, err := setFunctionBreakpoint(p, "main.main")
-		assertNoError(err, t, "SetBreakpoint()")
+		setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(proc.Continue(p), t, "Continue()")
 		resumeChan := make(chan struct{}, 1)
 		go func() {
@@ -46,7 +45,7 @@ func TestIssue419(t *testing.T) {
 			if p.Pid() <= 0 {
 				// if we don't stop the inferior the test will never finish
 				p.RequestManualStop()
-				err := p.Kill()
+				err := p.Detach(true)
 				errChan <- errIssue419{pid: p.Pid(), err: err}
 				return
 			}
@@ -57,7 +56,7 @@ func TestIssue419(t *testing.T) {
 		errChan <- proc.Continue(p)
 	})
 
-	for i :=0; i<2; i++ {
+	for i := 0; i < 2; i++ {
 		err := <-errChan
 
 		if v, ok := err.(errIssue419); ok {
@@ -65,7 +64,7 @@ func TestIssue419(t *testing.T) {
 			continue
 		}
 
-		if _, exited := err.(proc.ProcessExitedError); !exited {
+		if _, exited := err.(proc.ErrProcessExited); !exited {
 			t.Fatalf("Unexpected error after Continue(): %v\n", err)
 		}
 	}

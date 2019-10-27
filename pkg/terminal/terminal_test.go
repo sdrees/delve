@@ -1,10 +1,12 @@
 package terminal
 
 import (
+	"errors"
+	"net/rpc"
 	"runtime"
 	"testing"
 
-	"github.com/derekparker/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/config"
 )
 
 type tRule struct {
@@ -37,9 +39,14 @@ func platformCases() []tCase {
 		// Should be case-sensitive
 		{[]tRule{{"/tmp/path", "/new/path2"}}, "/TmP/path/file.go", "/TmP/path/file.go"},
 	}
+	casesFreebsd := []tCase{
+		// Should be case-sensitive
+		{[]tRule{{"/tmp/path", "/new/path2"}}, "/TmP/path/file.go", "/TmP/path/file.go"},
+	}
 	casesDarwin := []tCase{
-		// Should be case-insensitive
-		{[]tRule{{"/tmp/path", "/new/path2"}}, "/TmP/PaTh/file.go", "/new/path2/file.go"},
+		// Can be either case-sensitive or case-insensitive depending on
+		// filesystem settings, we always treat it as case-sensitive.
+		{[]tRule{{"/tmp/path", "/new/path2"}}, "/TmP/PaTh/file.go", "/TmP/PaTh/file.go"},
 	}
 	casesWindows := []tCase{
 		// Should not depend on separator at the end of rule path
@@ -62,6 +69,9 @@ func platformCases() []tCase {
 	if runtime.GOOS == "linux" {
 		return append(casesUnix, casesLinux...)
 	}
+	if runtime.GOOS == "freebsd" {
+		return append(casesUnix, casesFreebsd...)
+	}
 	return casesUnix
 }
 
@@ -74,6 +84,24 @@ func TestSubstitutePath(t *testing.T) {
 		res := New(nil, &config.Config{SubstitutePath: subRules}).substitutePath(c.path)
 		if c.res != res {
 			t.Errorf("terminal.SubstitutePath(%q) => %q, want %q", c.path, res, c.res)
+		}
+	}
+}
+
+func TestIsErrProcessExited(t *testing.T) {
+	tests := []struct {
+		name   string
+		err    error
+		result bool
+	}{
+		{"empty error", errors.New(""), false},
+		{"non-ServerError", errors.New("Process 33122 has exited with status 0"), false},
+		{"ServerError with zero status", rpc.ServerError("Process 33122 has exited with status 0"), true},
+		{"ServerError with non-zero status", rpc.ServerError("Process 2 has exited with status 25"), true},
+	}
+	for _, test := range tests {
+		if isErrProcessExited(test.err) != test.result {
+			t.Error(test.name)
 		}
 	}
 }

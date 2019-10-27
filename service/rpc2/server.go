@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/derekparker/delve/service"
-	"github.com/derekparker/delve/service/api"
-	"github.com/derekparker/delve/service/debugger"
+	"github.com/go-delve/delve/service"
+	"github.com/go-delve/delve/service/api"
+	"github.com/go-delve/delve/service/debugger"
 )
 
 type RPCServer struct {
@@ -55,13 +55,27 @@ type DetachOut struct {
 
 // Detach detaches the debugger, optionally killing the process.
 func (s *RPCServer) Detach(arg DetachIn, out *DetachOut) error {
-	return s.debugger.Detach(arg.Kill)
+	err := s.debugger.Detach(arg.Kill)
+	if s.config.DisconnectChan != nil {
+		close(s.config.DisconnectChan)
+		s.config.DisconnectChan = nil
+	}
+	return err
 }
 
 type RestartIn struct {
 	// Position to restart from, if it starts with 'c' it's a checkpoint ID,
 	// otherwise it's an event number. Only valid for recorded targets.
 	Position string
+
+	// ResetArgs tell whether NewArgs should take effect.
+	ResetArgs bool
+	// NewArgs are arguments to launch a new process.  They replace only the
+	// argv[1] and later. Argv[0] cannot be changed.
+	NewArgs []string
+
+	// When Rerecord is set the target will be rerecorded
+	Rerecord bool
 }
 
 type RestartOut struct {
@@ -74,11 +88,13 @@ func (s *RPCServer) Restart(arg RestartIn, out *RestartOut) error {
 		return errors.New("cannot restart process Delve did not create")
 	}
 	var err error
-	out.DiscardedBreakpoints, err = s.debugger.Restart(arg.Position)
+	out.DiscardedBreakpoints, err = s.debugger.Restart(arg.Rerecord, arg.Position, arg.ResetArgs, arg.NewArgs)
 	return err
 }
 
 type StateIn struct {
+	// If NonBlocking is true State will return immediately even if the target process is running.
+	NonBlocking bool
 }
 
 type StateOut struct {
@@ -87,7 +103,7 @@ type StateOut struct {
 
 // State returns the current debugger state.
 func (s *RPCServer) State(arg StateIn, out *StateOut) error {
-	st, err := s.debugger.State()
+	st, err := s.debugger.State(arg.NonBlocking)
 	if err != nil {
 		return err
 	}
@@ -139,10 +155,12 @@ func (s *RPCServer) GetBreakpoint(arg GetBreakpointIn, out *GetBreakpointOut) er
 }
 
 type StacktraceIn struct {
-	Id    int
-	Depth int
-	Full  bool
-	Cfg   *api.LoadConfig
+	Id     int
+	Depth  int
+	Full   bool
+	Defers bool // read deferred functions (equivalent to passing StacktraceReadDefers in Opts)
+	Opts   api.StacktraceOptions
+	Cfg    *api.LoadConfig
 }
 
 type StacktraceOut struct {
@@ -158,12 +176,29 @@ func (s *RPCServer) Stacktrace(arg StacktraceIn, out *StacktraceOut) error {
 	if cfg == nil && arg.Full {
 		cfg = &api.LoadConfig{true, 1, 64, 64, -1}
 	}
-	locs, err := s.debugger.Stacktrace(arg.Id, arg.Depth, api.LoadConfigToProc(cfg))
-	if err != nil {
-		return err
+	if arg.Defers {
+		arg.Opts |= api.StacktraceReadDefers
 	}
-	out.Locations = locs
-	return nil
+	var err error
+	out.Locations, err = s.debugger.Stacktrace(arg.Id, arg.Depth, arg.Opts, api.LoadConfigToProc(cfg))
+	return err
+}
+
+type AncestorsIn struct {
+	GoroutineID  int
+	NumAncestors int
+	Depth        int
+}
+
+type AncestorsOut struct {
+	Ancestors []api.Ancestor
+}
+
+// Ancestors returns the stacktraces for the ancestors of a goroutine.
+func (s *RPCServer) Ancestors(arg AncestorsIn, out *AncestorsOut) error {
+	var err error
+	out.Ancestors, err = s.debugger.Ancestors(arg.GoroutineID, arg.NumAncestors, arg.Depth)
+	return err
 }
 
 type ListBreakpointsIn struct {
@@ -194,9 +229,7 @@ type CreateBreakpointOut struct {
 //
 // - If arg.Breakpoint.FunctionName is not an empty string
 // the breakpoint will be created on the specified function:line
-// location. Note that setting a breakpoint on a function's entry point
-// (line == 0) can have surprising consequences, it is advisable to
-// use line = -1 instead which will skip the prologue.
+// location.
 //
 // - Otherwise the value specified by arg.Breakpoint.Addr will be used.
 func (s *RPCServer) CreateBreakpoint(arg CreateBreakpointIn, out *CreateBreakpointOut) error {
@@ -311,7 +344,7 @@ type ListPackageVarsOut struct {
 
 // ListPackageVars lists all package variables in the context of the current thread.
 func (s *RPCServer) ListPackageVars(arg ListPackageVarsIn, out *ListPackageVarsOut) error {
-	state, err := s.debugger.State()
+	state, err := s.debugger.State(false)
 	if err != nil {
 		return err
 	}
@@ -342,7 +375,7 @@ type ListRegistersOut struct {
 // ListRegisters lists registers and their values.
 func (s *RPCServer) ListRegisters(arg ListRegistersIn, out *ListRegistersOut) error {
 	if arg.ThreadID == 0 {
-		state, err := s.debugger.State()
+		state, err := s.debugger.State(false)
 		if err != nil {
 			return err
 		}
@@ -409,7 +442,7 @@ type EvalOut struct {
 
 // EvalVariable returns a variable in the specified context.
 //
-// See https://github.com/derekparker/delve/wiki/Expressions for
+// See https://github.com/go-delve/delve/wiki/Expressions for
 // a description of acceptable values of arg.Expr.
 func (s *RPCServer) Eval(arg EvalIn, out *EvalOut) error {
 	cfg := arg.Cfg
@@ -494,19 +527,28 @@ func (s *RPCServer) ListTypes(arg ListTypesIn, out *ListTypesOut) error {
 }
 
 type ListGoroutinesIn struct {
+	Start int
+	Count int
 }
 
 type ListGoroutinesOut struct {
 	Goroutines []*api.Goroutine
+	Nextg      int
 }
 
 // ListGoroutines lists all goroutines.
+// If Count is specified ListGoroutines will return at the first Count
+// goroutines and an index in Nextg, that can be passed as the Start
+// parameter, to get more goroutines from ListGoroutines.
+// Passing a value of Start that wasn't returned by ListGoroutines will skip
+// an undefined number of goroutines.
 func (s *RPCServer) ListGoroutines(arg ListGoroutinesIn, out *ListGoroutinesOut) error {
-	gs, err := s.debugger.Goroutines()
+	gs, nextg, err := s.debugger.Goroutines(arg.Start, arg.Count)
 	if err != nil {
 		return err
 	}
 	out.Goroutines = gs
+	out.Nextg = nextg
 	return nil
 }
 
@@ -526,8 +568,9 @@ func (c *RPCServer) AttachedToExistingProcess(arg AttachedToExistingProcessIn, o
 }
 
 type FindLocationIn struct {
-	Scope api.EvalScope
-	Loc   string
+	Scope                     api.EvalScope
+	Loc                       string
+	IncludeNonExecutableLines bool
 }
 
 type FindLocationOut struct {
@@ -549,7 +592,7 @@ type FindLocationOut struct {
 // NOTE: this function does not actually set breakpoints.
 func (c *RPCServer) FindLocation(arg FindLocationIn, out *FindLocationOut) error {
 	var err error
-	out.Locations, err = c.debugger.FindLocation(arg.Scope, arg.Loc)
+	out.Locations, err = c.debugger.FindLocation(arg.Scope, arg.Loc, arg.IncludeNonExecutableLines)
 	return err
 }
 
@@ -567,12 +610,12 @@ type DisassembleOut struct {
 //
 // If both StartPC and EndPC are non-zero the specified range will be disassembled, otherwise the function containing StartPC will be disassembled.
 //
-// Scope is used to mark the instruction the specified gorutine is stopped at.
+// Scope is used to mark the instruction the specified goroutine is stopped at.
 //
 // Disassemble will also try to calculate the destination address of an absolute indirect CALL if it happens to be the instruction the selected goroutine is stopped at.
 func (c *RPCServer) Disassemble(arg DisassembleIn, out *DisassembleOut) error {
 	var err error
-	out.Disassemble, err = c.debugger.Disassemble(arg.Scope, arg.StartPC, arg.EndPC, arg.Flavour)
+	out.Disassemble, err = c.debugger.Disassemble(arg.Scope.GoroutineID, arg.StartPC, arg.EndPC, arg.Flavour)
 	return err
 }
 
@@ -625,4 +668,63 @@ type ClearCheckpointOut struct {
 
 func (s *RPCServer) ClearCheckpoint(arg ClearCheckpointIn, out *ClearCheckpointOut) error {
 	return s.debugger.ClearCheckpoint(arg.ID)
+}
+
+type IsMulticlientIn struct {
+}
+
+type IsMulticlientOut struct {
+	// IsMulticlient returns true if the headless instance was started with --accept-multiclient
+	IsMulticlient bool
+}
+
+func (s *RPCServer) IsMulticlient(arg IsMulticlientIn, out *IsMulticlientOut) error {
+	*out = IsMulticlientOut{
+		IsMulticlient: s.config.AcceptMulti,
+	}
+	return nil
+}
+
+// FunctionReturnLocationsIn holds arguments for the
+// FunctionReturnLocationsRPC call. It holds the name of
+// the function for which all return locations should be
+// given.
+type FunctionReturnLocationsIn struct {
+	// FnName is the name of the function for which all
+	// return locations should be given.
+	FnName string
+}
+
+// FunctionReturnLocationsOut holds the result of the FunctionReturnLocations
+// RPC call. It provides the list of addresses that the given function returns,
+// for example with a `RET` instruction or `CALL runtime.deferreturn`.
+type FunctionReturnLocationsOut struct {
+	// Addrs is the list of all locations where the given function returns.
+	Addrs []uint64
+}
+
+// FunctionReturnLocations is the implements the client call of the same name. Look at client documentation for more information.
+func (s *RPCServer) FunctionReturnLocations(in FunctionReturnLocationsIn, out *FunctionReturnLocationsOut) error {
+	addrs, err := s.debugger.FunctionReturnLocations(in.FnName)
+	if err != nil {
+		return err
+	}
+	*out = FunctionReturnLocationsOut{
+		Addrs: addrs,
+	}
+	return nil
+}
+
+// ListDynamicLibrariesIn holds the arguments of ListDynamicLibraries
+type ListDynamicLibrariesIn struct {
+}
+
+// ListDynamicLibrariesOut holds the return values of ListDynamicLibraries
+type ListDynamicLibrariesOut struct {
+	List []api.Image
+}
+
+func (s *RPCServer) ListDynamicLibraries(in ListDynamicLibrariesIn, out *ListDynamicLibrariesOut) error {
+	out.List = s.debugger.ListDynamicLibraries()
+	return nil
 }

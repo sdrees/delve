@@ -8,6 +8,8 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -15,6 +17,10 @@ import (
 // Record uses rr to record the execution of the specified program and
 // returns the trace directory's path.
 func Record(cmd []string, wd string, quiet bool) (tracedir string, err error) {
+	if err := checkRRAvailabe(); err != nil {
+		return "", err
+	}
+
 	rfd, wfd, err := os.Pipe()
 	if err != nil {
 		return "", err
@@ -48,14 +54,18 @@ func Record(cmd []string, wd string, quiet bool) (tracedir string, err error) {
 
 // Replay starts an instance of rr in replay mode, with the specified trace
 // directory, and connects to it.
-func Replay(tracedir string, quiet bool) (*Process, error) {
+func Replay(tracedir string, quiet, deleteOnDetach bool, debugInfoDirs []string) (*Process, error) {
+	if err := checkRRAvailabe(); err != nil {
+		return nil, err
+	}
+
 	rrcmd := exec.Command("rr", "replay", "--dbgport=0", tracedir)
 	rrcmd.Stdout = os.Stdout
 	stderr, err := rrcmd.StderrPipe()
 	if err != nil {
 		return nil, err
 	}
-	rrcmd.SysProcAttr = backgroundSysProcAttr()
+	rrcmd.SysProcAttr = sysProcAttr(false)
 
 	initch := make(chan rrInit)
 	go rrStderrParser(stderr, initch, quiet)
@@ -68,18 +78,50 @@ func Replay(tracedir string, quiet bool) (*Process, error) {
 	init := <-initch
 	if init.err != nil {
 		rrcmd.Process.Kill()
-		return nil, err
+		return nil, init.err
 	}
 
 	p := New(rrcmd.Process)
 	p.tracedir = tracedir
-	err = p.Dial(init.port, init.exe, 0)
+	if deleteOnDetach {
+		p.onDetach = func() {
+			safeRemoveAll(p.tracedir)
+		}
+	}
+	err = p.Dial(init.port, init.exe, 0, debugInfoDirs)
 	if err != nil {
 		rrcmd.Process.Kill()
 		return nil, err
 	}
 
 	return p, nil
+}
+
+// ErrPerfEventParanoid is the error returned by Reply and Record if
+// /proc/sys/kernel/perf_event_paranoid is greater than 1.
+type ErrPerfEventParanoid struct {
+	actual int
+}
+
+func (err ErrPerfEventParanoid) Error() string {
+	return fmt.Sprintf("rr needs /proc/sys/kernel/perf_event_paranoid <= 1, but it is %d", err.actual)
+}
+
+func checkRRAvailabe() error {
+	if _, err := exec.LookPath("rr"); err != nil {
+		return &ErrBackendUnavailable{}
+	}
+
+	// Check that /proc/sys/kernel/perf_event_paranoid doesn't exist or is <= 1.
+	buf, err := ioutil.ReadFile("/proc/sys/kernel/perf_event_paranoid")
+	if err == nil {
+		perfEventParanoid, _ := strconv.Atoi(strings.TrimSpace(string(buf)))
+		if perfEventParanoid > 1 {
+			return ErrPerfEventParanoid{perfEventParanoid}
+		}
+	}
+
+	return nil
 }
 
 type rrInit struct {
@@ -142,7 +184,7 @@ func rrParseGdbCommand(line string) rrInit {
 			arg := fields[i+1]
 
 			if !strings.HasPrefix(arg, targetCmd) {
-				return rrInit{err: &ErrMalformedRRGdbCommand{line, "contents of -ex argument unexpected"}}
+				continue
 			}
 
 			port = arg[len(targetCmd):]
@@ -221,11 +263,36 @@ func splitQuotedFields(in string) []string {
 }
 
 // RecordAndReplay acts like calling Record and then Replay.
-func RecordAndReplay(cmd []string, wd string, quiet bool) (p *Process, tracedir string, err error) {
+func RecordAndReplay(cmd []string, wd string, quiet bool, debugInfoDirs []string) (p *Process, tracedir string, err error) {
 	tracedir, err = Record(cmd, wd, quiet)
 	if tracedir == "" {
 		return nil, "", err
 	}
-	p, err = Replay(tracedir, quiet)
+	p, err = Replay(tracedir, quiet, true, debugInfoDirs)
 	return p, tracedir, err
+}
+
+// safeRemoveAll removes dir and its contents but only as long as dir does
+// not contain directories.
+func safeRemoveAll(dir string) {
+	dh, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	defer dh.Close()
+	fis, err := dh.Readdir(-1)
+	if err != nil {
+		return
+	}
+	for _, fi := range fis {
+		if fi.IsDir() {
+			return
+		}
+	}
+	for _, fi := range fis {
+		if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
+			return
+		}
+	}
+	os.Remove(dir)
 }

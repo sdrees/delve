@@ -1,23 +1,26 @@
 package service_test
 
 import (
+	"errors"
 	"fmt"
+	"go/constant"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"testing"
 
-	"github.com/derekparker/delve/pkg/goversion"
-	"github.com/derekparker/delve/pkg/proc"
-	"github.com/derekparker/delve/pkg/proc/gdbserial"
-	"github.com/derekparker/delve/pkg/proc/native"
-	"github.com/derekparker/delve/service/api"
+	"github.com/go-delve/delve/pkg/goversion"
+	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/gdbserial"
+	"github.com/go-delve/delve/pkg/proc/native"
+	"github.com/go-delve/delve/service/api"
 
-	protest "github.com/derekparker/delve/pkg/proc/test"
+	protest "github.com/go-delve/delve/pkg/proc/test"
 )
 
-var pnormalLoadConfig = proc.LoadConfig{true, 1, 64, 64, -1}
-var pshortLoadConfig = proc.LoadConfig{false, 0, 64, 0, 3}
+var pnormalLoadConfig = proc.LoadConfig{true, 1, 64, 64, -1, 0}
+var pshortLoadConfig = proc.LoadConfig{false, 0, 64, 0, 3, 0}
 
 type varTest struct {
 	name         string
@@ -70,20 +73,19 @@ func findFirstNonRuntimeFrame(p proc.Process) (proc.Stackframe, error) {
 	return proc.Stackframe{}, fmt.Errorf("non-runtime frame not found")
 }
 
-func evalVariable(p proc.Process, symbol string, cfg proc.LoadConfig) (*proc.Variable, error) {
-	var scope *proc.EvalScope
-	var err error
-
-	if testBackend == "rr" {
-		var frame proc.Stackframe
-		frame, err = findFirstNonRuntimeFrame(p)
-		if err == nil {
-			scope = proc.FrameToScope(p, frame)
-		}
-	} else {
-		scope, err = proc.GoroutineScope(p.CurrentThread())
+func evalScope(p proc.Process) (*proc.EvalScope, error) {
+	if testBackend != "rr" {
+		return proc.GoroutineScope(p.CurrentThread())
 	}
+	frame, err := findFirstNonRuntimeFrame(p)
+	if err != nil {
+		return nil, err
+	}
+	return proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frame), nil
+}
 
+func evalVariable(p proc.Process, symbol string, cfg proc.LoadConfig) (*proc.Variable, error) {
+	scope, err := evalScope(p)
 	if err != nil {
 		return nil, err
 	}
@@ -106,19 +108,26 @@ func setVariable(p proc.Process, symbol, value string) error {
 }
 
 func withTestProcess(name string, t *testing.T, fn func(p proc.Process, fixture protest.Fixture)) {
-	fixture := protest.BuildFixture(name, 0)
+	withTestProcessArgs(name, t, ".", []string{}, 0, fn)
+}
+
+func withTestProcessArgs(name string, t *testing.T, wd string, args []string, buildFlags protest.BuildFlags, fn func(p proc.Process, fixture protest.Fixture)) {
+	if buildMode == "pie" {
+		buildFlags |= protest.BuildModePIE
+	}
+	fixture := protest.BuildFixture(name, buildFlags)
 	var p proc.Process
 	var err error
 	var tracedir string
 	switch testBackend {
 	case "native":
-		p, err = native.Launch([]string{fixture.Path}, ".")
+		p, err = native.Launch(append([]string{fixture.Path}, args...), wd, false, []string{})
 	case "lldb":
-		p, err = gdbserial.LLDBLaunch([]string{fixture.Path}, ".")
+		p, err = gdbserial.LLDBLaunch(append([]string{fixture.Path}, args...), wd, false, []string{})
 	case "rr":
 		protest.MustHaveRecordingAllowed(t)
 		t.Log("recording")
-		p, tracedir, err = gdbserial.RecordAndReplay([]string{fixture.Path}, ".", true)
+		p, tracedir, err = gdbserial.RecordAndReplay(append([]string{fixture.Path}, args...), wd, true, []string{})
 		t.Logf("replaying %q", tracedir)
 	default:
 		t.Fatalf("unknown backend %q", testBackend)
@@ -128,11 +137,7 @@ func withTestProcess(name string, t *testing.T, fn func(p proc.Process, fixture 
 	}
 
 	defer func() {
-		p.Halt()
 		p.Detach(true)
-		if tracedir != "" {
-			protest.SafeRemoveAll(tracedir)
-		}
 	}()
 
 	fn(p, fixture)
@@ -213,6 +218,54 @@ func TestVariableEvaluation(t *testing.T) {
 				assertNoError(err, t, "EvalVariable()")
 				assertVariable(t, variable, tc)
 			}
+		}
+	})
+}
+
+func TestSetVariable(t *testing.T) {
+	var testcases = []struct {
+		name     string
+		typ      string // type of <name>
+		startVal string // original value of <name>
+		expr     string
+		finalVal string // new value of <name> after executing <name> = <expr>
+	}{
+		{"b.ptr", "*main.A", "*main.A {val: 1337}", "nil", "*main.A nil"},
+		{"m2", "map[int]*main.astruct", "map[int]*main.astruct [1: *{A: 10, B: 11}, ]", "nil", "map[int]*main.astruct nil"},
+		{"fn1", "main.functype", "main.afunc", "nil", "nil"},
+		{"ch1", "chan int", "chan int 4/10", "nil", "chan int nil"},
+		{"s2", "[]main.astruct", "[]main.astruct len: 8, cap: 8, [{A: 1, B: 2},{A: 3, B: 4},{A: 5, B: 6},{A: 7, B: 8},{A: 9, B: 10},{A: 11, B: 12},{A: 13, B: 14},{A: 15, B: 16}]", "nil", "[]main.astruct len: 0, cap: 0, nil"},
+		{"err1", "error", "error(*main.astruct) *{A: 1, B: 2}", "nil", "error nil"},
+		{"s1[0]", "string", `"one"`, `""`, `""`},
+		{"as1", "main.astruct", "main.astruct {A: 1, B: 1}", `m1["Malone"]`, "main.astruct {A: 2, B: 3}"},
+
+		{"iface1", "interface {}", "interface {}(*main.astruct) *{A: 1, B: 2}", "nil", "interface {} nil"},
+		{"iface1", "interface {}", "interface {} nil", "iface2", "interface {}(string) \"test\""},
+		{"iface1", "interface {}", "interface {}(string) \"test\"", "parr", "interface {}(*[4]int) *[0,1,2,3]"},
+
+		{"s3", "[]int", `[]int len: 0, cap: 6, []`, "s4[2:5]", "[]int len: 3, cap: 3, [3,4,5]"},
+		{"s3", "[]int", "[]int len: 3, cap: 3, [3,4,5]", "arr1[:]", "[]int len: 4, cap: 4, [0,1,2,3]"},
+	}
+
+	withTestProcess("testvariables2", t, func(p proc.Process, fixture protest.Fixture) {
+		assertNoError(proc.Continue(p), t, "Continue()")
+
+		for _, tc := range testcases {
+			if tc.name == "iface1" && tc.expr == "parr" {
+				if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 11) {
+					// conversion pointer -> eface not supported prior to Go 1.11
+					continue
+				}
+			}
+			variable, err := evalVariable(p, tc.name, pnormalLoadConfig)
+			assertNoError(err, t, "EvalVariable()")
+			assertVariable(t, variable, varTest{tc.name, true, tc.startVal, "", tc.typ, nil})
+
+			assertNoError(setVariable(p, tc.name, tc.expr), t, "SetVariable()")
+
+			variable, err = evalVariable(p, tc.name, pnormalLoadConfig)
+			assertNoError(err, t, "EvalVariable()")
+			assertVariable(t, variable, varTest{tc.name, true, tc.finalVal, "", tc.typ, nil})
 		}
 	})
 }
@@ -405,7 +458,7 @@ func TestLocalVariables(t *testing.T) {
 				var frame proc.Stackframe
 				frame, err = findFirstNonRuntimeFrame(p)
 				if err == nil {
-					scope = proc.FrameToScope(p, frame)
+					scope = proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frame)
 				}
 			} else {
 				scope, err = proc.GoroutineScope(p.CurrentThread())
@@ -534,7 +587,7 @@ func TestEvalExpression(t *testing.T) {
 		{"*p3", false, "", "", "int", fmt.Errorf("nil pointer dereference")},
 
 		// channels
-		{"ch1", true, "chan int 0/2", "chan int 0/2", "chan int", nil},
+		{"ch1", true, "chan int 4/10", "chan int 4/10", "chan int", nil},
 		{"chnil", true, "chan int nil", "chan int nil", "chan int", nil},
 		{"ch1+1", false, "", "", "", fmt.Errorf("can not convert 1 constant to chan int")},
 
@@ -552,6 +605,8 @@ func TestEvalExpression(t *testing.T) {
 		{"err2", true, "error(*main.bstruct) *{a: main.astruct {A: 1, B: 2}}", "error(*main.bstruct) 0x…", "error", nil},
 		{"errnil", true, "error nil", "error nil", "error", nil},
 		{"iface1", true, "interface {}(*main.astruct) *{A: 1, B: 2}", "interface {}(*main.astruct) 0x…", "interface {}", nil},
+		{"iface1.A", false, "1", "1", "int", nil},
+		{"iface1.B", false, "2", "2", "int", nil},
 		{"iface2", true, "interface {}(string) \"test\"", "interface {}(string) \"test\"", "interface {}", nil},
 		{"iface3", true, "interface {}(map[string]go/constant.Value) []", "interface {}(map[string]go/constant.Value) []", "interface {}", nil},
 		{"iface4", true, "interface {}([]go/constant.Value) [4]", "interface {}([]go/constant.Value) [...]", "interface {}", nil},
@@ -614,6 +669,7 @@ func TestEvalExpression(t *testing.T) {
 		{"c1.pb.a != *(c1.sa[0])", false, "false", "false", "", nil},
 		{"c1.pb.a == *(c1.sa[1])", false, "false", "false", "", nil},
 		{"c1.pb.a != *(c1.sa[1])", false, "true", "true", "", nil},
+		{`longstr == "not this"`, false, "false", "false", "", nil},
 
 		// builtins
 		{"cap(parr)", false, "4", "4", "", nil},
@@ -626,11 +682,11 @@ func TestEvalExpression(t *testing.T) {
 		{"len(s3)", false, "0", "0", "", nil},
 		{"cap(nilslice)", false, "0", "0", "", nil},
 		{"len(nilslice)", false, "0", "0", "", nil},
-		{"cap(ch1)", false, "2", "2", "", nil},
-		{"len(ch1)", false, "0", "0", "", nil},
+		{"cap(ch1)", false, "10", "10", "", nil},
+		{"len(ch1)", false, "4", "4", "", nil},
 		{"cap(chnil)", false, "0", "0", "", nil},
 		{"len(chnil)", false, "0", "0", "", nil},
-		{"len(m1)", false, "41", "41", "", nil},
+		{"len(m1)", false, "66", "66", "", nil},
 		{"len(mnil)", false, "0", "0", "", nil},
 		{"imag(cpx1)", false, "2", "2", "", nil},
 		{"real(cpx1)", false, "1", "1", "", nil},
@@ -675,11 +731,10 @@ func TestEvalExpression(t *testing.T) {
 		{"i2 + p1", false, "", "", "", fmt.Errorf("mismatched types \"int\" and \"*int\"")},
 		{"i2 + f1", false, "", "", "", fmt.Errorf("mismatched types \"int\" and \"float64\"")},
 		{"i2 << f1", false, "", "", "", fmt.Errorf("shift count type float64, must be unsigned integer")},
-		{"i2 << -1", false, "", "", "", fmt.Errorf("shift count type int, must be unsigned integer")},
-		{"i2 << i3", false, "", "", "int", fmt.Errorf("shift count type int, must be unsigned integer")},
+		{"i2 << -1", false, "", "", "", fmt.Errorf("shift count must not be negative")},
 		{"*(i2 + i3)", false, "", "", "", fmt.Errorf("expression \"(i2 + i3)\" (int) can not be dereferenced")},
 		{"i2.member", false, "", "", "", fmt.Errorf("i2 (type int) is not a struct")},
-		{"fmt.Println(\"hello\")", false, "", "", "", fmt.Errorf("no type entry found, use 'types' for a list of valid types")},
+		{"fmt.Println(\"hello\")", false, "", "", "", fmt.Errorf("function calls not allowed without using 'call'")},
 		{"*nil", false, "", "", "", fmt.Errorf("nil can not be dereferenced")},
 		{"!nil", false, "", "", "", fmt.Errorf("operator ! can not be applied to \"nil\"")},
 		{"&nil", false, "", "", "", fmt.Errorf("can not take address of \"nil\"")},
@@ -697,6 +752,8 @@ func TestEvalExpression(t *testing.T) {
 		{"uint8(i5)", false, "253", "253", "uint8", nil},
 		{"int8(i5)", false, "-3", "-3", "int8", nil},
 		{"int8(i6)", false, "12", "12", "int8", nil},
+		{"string(byteslice[0])", false, `"t"`, `"t"`, "string", nil},
+		{"string(runeslice[0])", false, `"t"`, `"t"`, "string", nil},
 
 		// misc
 		{"i1", true, "1", "1", "int", nil},
@@ -714,6 +771,44 @@ func TestEvalExpression(t *testing.T) {
 		{"emptyslice", false, `[]string len: 0, cap: 0, []`, `[]string len: 0, cap: 0, []`, "[]string", nil},
 		{"emptymap", false, `map[string]string []`, `map[string]string []`, "map[string]string", nil},
 		{"mnil", false, `map[string]main.astruct nil`, `map[string]main.astruct nil`, "map[string]main.astruct", nil},
+
+		// conversions between string/[]byte/[]rune (issue #548)
+		{"runeslice", true, `[]int32 len: 4, cap: 4, [116,232,115,116]`, `[]int32 len: 4, cap: 4, [...]`, "[]int32", nil},
+		{"byteslice", true, `[]uint8 len: 5, cap: 5, [116,195,168,115,116]`, `[]uint8 len: 5, cap: 5, [...]`, "[]uint8", nil},
+		{"[]byte(str1)", false, `[]uint8 len: 11, cap: 11, [48,49,50,51,52,53,54,55,56,57,48]`, `[]uint8 len: 11, cap: 11, [48,49,50,51,52,53,54,55,56,57,48]`, "[]uint8", nil},
+		{"[]uint8(str1)", false, `[]uint8 len: 11, cap: 11, [48,49,50,51,52,53,54,55,56,57,48]`, `[]uint8 len: 11, cap: 11, [48,49,50,51,52,53,54,55,56,57,48]`, "[]uint8", nil},
+		{"[]rune(str1)", false, `[]int32 len: 11, cap: 11, [48,49,50,51,52,53,54,55,56,57,48]`, `[]int32 len: 11, cap: 11, [48,49,50,51,52,53,54,55,56,57,48]`, "[]int32", nil},
+		{"[]int32(str1)", false, `[]int32 len: 11, cap: 11, [48,49,50,51,52,53,54,55,56,57,48]`, `[]int32 len: 11, cap: 11, [48,49,50,51,52,53,54,55,56,57,48]`, "[]int32", nil},
+		{"string(byteslice)", false, `"tèst"`, `""`, "string", nil},
+		{"[]int32(string(byteslice))", false, `[]int32 len: 4, cap: 4, [116,232,115,116]`, `[]int32 len: 0, cap: 0, nil`, "[]int32", nil},
+		{"string(runeslice)", false, `"tèst"`, `""`, "string", nil},
+		{"[]byte(string(runeslice))", false, `[]uint8 len: 5, cap: 5, [116,195,168,115,116]`, `[]uint8 len: 0, cap: 0, nil`, "[]uint8", nil},
+		{"*(*[5]byte)(uintptr(&byteslice[0]))", false, `[5]uint8 [116,195,168,115,116]`, `[5]uint8 [...]`, "[5]uint8", nil},
+		{"string(bytearray)", false, `"tèst"`, `""`, "string", nil},
+		{"string(runearray)", false, `"tèst"`, `""`, "string", nil},
+		{"string(str1)", false, `"01234567890"`, `"01234567890"`, "string", nil},
+
+		// access to channel field members
+		{"ch1.qcount", false, "4", "4", "uint", nil},
+		{"ch1.dataqsiz", false, "10", "10", "uint", nil},
+		{"ch1.buf", false, `*[10]int [1,4,3,2,0,0,0,0,0,0]`, `(*[10]int)(…`, "*[10]int", nil},
+		{"ch1.buf[0]", false, "1", "1", "int", nil},
+
+		// shortcircuited logical operators
+		{"nilstruct != nil && nilstruct.A == 1", false, "false", "false", "", nil},
+		{"nilstruct == nil || nilstruct.A == 1", false, "true", "true", "", nil},
+
+		{"afunc", true, `main.afunc`, `main.afunc`, `func()`, nil},
+		{"main.afunc2", true, `main.afunc2`, `main.afunc2`, `func()`, nil},
+
+		{"s2[0].Error", false, "main.(*astruct).Error", "main.(*astruct).Error", "func() string", nil},
+		{"s2[0].NonPointerRecieverMethod", false, "main.astruct.NonPointerRecieverMethod", "main.astruct.NonPointerRecieverMethod", "func()", nil},
+		{"as2.Error", false, "main.(*astruct).Error", "main.(*astruct).Error", "func() string", nil},
+		{"as2.NonPointerRecieverMethod", false, "main.astruct.NonPointerRecieverMethod", "main.astruct.NonPointerRecieverMethod", "func()", nil},
+
+		{`iface2map.(data)`, false, "…", "…", "map[string]interface {}", nil},
+
+		{"issue1578", false, "main.Block {cache: *main.Cache nil}", "main.Block {cache: *main.Cache nil}", "main.Block", nil},
 	}
 
 	ver, _ := goversion.Parse(runtime.Version())
@@ -731,6 +826,10 @@ func TestEvalExpression(t *testing.T) {
 		assertNoError(proc.Continue(p), t, "Continue() returned an error")
 		for _, tc := range testcases {
 			variable, err := evalVariable(p, tc.name, pnormalLoadConfig)
+			if err != nil && err.Error() == "evaluating methods not supported on this version of Go" {
+				// this type of eval is unsupported with the current version of Go.
+				continue
+			}
 			if tc.err == nil {
 				assertNoError(err, t, fmt.Sprintf("EvalExpression(%s) returned an error", tc.name))
 				assertVariable(t, variable, tc)
@@ -790,24 +889,31 @@ func TestMapEvaluation(t *testing.T) {
 			t.Fatalf("Wrong type: %s", m1.Type)
 		}
 
-		if len(m1.Children)/2 != 41 {
+		if len(m1.Children)/2 != 64 {
 			t.Fatalf("Wrong number of children: %d", len(m1.Children)/2)
 		}
 
-		found := false
-		for i := range m1.Children {
-			if i%2 == 0 && m1.Children[i].Value == "Malone" {
-				found = true
-			}
-		}
-		if !found {
-			t.Fatalf("Could not find Malone")
+		m1sliced, err := evalVariable(p, "m1[64:]", pnormalLoadConfig)
+		assertNoError(err, t, "EvalVariable(m1[64:])")
+		if len(m1sliced.Children)/2 != int(m1.Len-64) {
+			t.Fatalf("Wrong number of children (after slicing): %d", len(m1sliced.Children)/2)
 		}
 
-		m1sliced, err := evalVariable(p, "m1[10:]", pnormalLoadConfig)
-		assertNoError(err, t, "EvalVariable(m1[10:])")
-		if len(m1sliced.Children)/2 != int(m1.Len-10) {
-			t.Fatalf("Wrong number of children (after slicing): %d", len(m1sliced.Children)/2)
+		countMalone := func(m *api.Variable) int {
+			found := 0
+			for i := range m.Children {
+				if i%2 == 0 && m.Children[i].Value == "Malone" {
+					found++
+				}
+			}
+			return found
+		}
+
+		found := countMalone(m1)
+		found += countMalone(api.ConvertVar(m1sliced))
+
+		if found != 1 {
+			t.Fatalf("Could not find Malone exactly 1 time: found %d", found)
 		}
 	})
 }
@@ -881,20 +987,23 @@ func TestPackageRenames(t *testing.T) {
 		{"amap", true, "interface {}(map[go/ast.BadExpr]net/http.Request) [{From: 2, To: 3}: *{Method: \"othermethod\", …", "", "interface {}", nil},
 
 		// Package name that doesn't match import path
-		{"iface3", true, `interface {}(*github.com/derekparker/delve/_fixtures/vendor/dir0/renamedpackage.SomeType) *{A: true}`, "", "interface {}", nil},
+		{"iface3", true, `interface {}(*github.com/go-delve/delve/_fixtures/internal/dir0/renamedpackage.SomeType) *{A: true}`, "", "interface {}", nil},
 
 		// Interfaces to anonymous types
 		{"amap2", true, "interface {}(*map[go/ast.BadExpr]net/http.Request) *[{From: 2, To: 3}: *{Method: \"othermethod\", …", "", "interface {}", nil},
-		{"dir0someType", true, "interface {}(*github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType) *{X: 3}", "", "interface {}", nil},
-		{"dir1someType", true, "interface {}(github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType) {X: 1, Y: 2}", "", "interface {}", nil},
-		{"amap3", true, "interface {}(map[github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType]github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType) [{X: 4}: {X: 5, Y: 6}, ]", "", "interface {}", nil},
-		{"anarray", true, `interface {}([2]github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType) [{X: 1},{X: 2}]`, "", "interface {}", nil},
-		{"achan", true, `interface {}(chan github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType) chan github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType 0/0`, "", "interface {}", nil},
-		{"aslice", true, `interface {}([]github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType) [{X: 3},{X: 4}]`, "", "interface {}", nil},
-		{"afunc", true, `interface {}(func(github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType, github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType)) main.main.func1`, "", "interface {}", nil},
-		{"astruct", true, `interface {}(*struct { A github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType; B github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType }) *{A: github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType {X: 1, Y: 2}, B: github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType {X: 3}}`, "", "interface {}", nil},
-		{"astruct2", true, `interface {}(*struct { github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType; X int }) *{SomeType: github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType {X: 1, Y: 2}, X: 10}`, "", "interface {}", nil},
-		{"iface2iface", true, `interface {}(*interface { AMethod(int) int; AnotherMethod(int) int }) **github.com/derekparker/delve/_fixtures/vendor/dir0/pkg.SomeType {X: 4}`, "", "interface {}", nil},
+		{"dir0someType", true, "interface {}(*github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType) *{X: 3}", "", "interface {}", nil},
+		{"dir1someType", true, "interface {}(github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType) {X: 1, Y: 2}", "", "interface {}", nil},
+		{"amap3", true, "interface {}(map[github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType]github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType) [{X: 4}: {X: 5, Y: 6}, ]", "", "interface {}", nil},
+		{"anarray", true, `interface {}([2]github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType) [{X: 1},{X: 2}]`, "", "interface {}", nil},
+		{"achan", true, `interface {}(chan github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType) chan github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType 0/0`, "", "interface {}", nil},
+		{"aslice", true, `interface {}([]github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType) [{X: 3},{X: 4}]`, "", "interface {}", nil},
+		{"afunc", true, `interface {}(func(github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType, github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType)) main.main.func1`, "", "interface {}", nil},
+		{"astruct", true, `interface {}(*struct { A github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType; B github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType }) *{A: github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType {X: 1, Y: 2}, B: github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType {X: 3}}`, "", "interface {}", nil},
+		{"astruct2", true, `interface {}(*struct { github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType; X int }) *{SomeType: github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType {X: 1, Y: 2}, X: 10}`, "", "interface {}", nil},
+		{"iface2iface", true, `interface {}(*interface { AMethod(int) int; AnotherMethod(int) int }) **github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType {X: 4}`, "", "interface {}", nil},
+
+		{`"dir0/pkg".A`, false, "0", "", "int", nil},
+		{`"dir1/pkg".A`, false, "1", "", "int", nil},
 	}
 
 	ver, _ := goversion.Parse(runtime.Version())
@@ -910,7 +1019,7 @@ func TestPackageRenames(t *testing.T) {
 			if ver.Major > 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 9, -1, 0, 0, ""}) {
 				// before 1.9 embedded struct field have fieldname == type
 				if tc.name == "astruct2" {
-					tc.value = `interface {}(*struct { github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType; X int }) *{github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType: github.com/derekparker/delve/_fixtures/vendor/dir1/pkg.SomeType {X: 1, Y: 2}, X: 10}`
+					tc.value = `interface {}(*struct { github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType; X int }) *{github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType: github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType {X: 1, Y: 2}, X: 10}`
 				}
 			}
 			variable, err := evalVariable(p, tc.name, pnormalLoadConfig)
@@ -926,5 +1035,412 @@ func TestPackageRenames(t *testing.T) {
 				}
 			}
 		}
+	})
+}
+
+func TestConstants(t *testing.T) {
+	testcases := []varTest{
+		{"a", true, "constTwo (2)", "", "main.ConstType", nil},
+		{"b", true, "constThree (3)", "", "main.ConstType", nil},
+		{"c", true, "bitZero|bitOne (3)", "", "main.BitFieldType", nil},
+		{"d", true, "33", "", "main.BitFieldType", nil},
+		{"e", true, "10", "", "main.ConstType", nil},
+		{"f", true, "0", "", "main.BitFieldType", nil},
+		{"bitZero", true, "1", "", "main.BitFieldType", nil},
+		{"bitOne", true, "2", "", "main.BitFieldType", nil},
+		{"constTwo", true, "2", "", "main.ConstType", nil},
+		{"pkg.SomeConst", true, "2", "", "int", nil},
+	}
+	ver, _ := goversion.Parse(runtime.Version())
+	if ver.Major > 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 10, -1, 0, 0, ""}) {
+		// Not supported on 1.9 or earlier
+		t.Skip("constants added in go 1.10")
+	}
+	withTestProcess("consts", t, func(p proc.Process, fixture protest.Fixture) {
+		assertNoError(proc.Continue(p), t, "Continue")
+		for _, testcase := range testcases {
+			variable, err := evalVariable(p, testcase.name, pnormalLoadConfig)
+			assertNoError(err, t, fmt.Sprintf("EvalVariable(%s)", testcase.name))
+			assertVariable(t, variable, testcase)
+		}
+	})
+}
+
+func setFunctionBreakpoint(p proc.Process, t testing.TB, fname string) *proc.Breakpoint {
+	_, f, l, _ := runtime.Caller(1)
+	f = filepath.Base(f)
+
+	addr, err := proc.FindFunctionLocation(p, fname, 0)
+	if err != nil {
+		t.Fatalf("%s:%d: FindFunctionLocation(%s): %v", f, l, fname, err)
+	}
+	bp, err := p.SetBreakpoint(addr, proc.UserBreakpoint, nil)
+	if err != nil {
+		t.Fatalf("%s:%d: FindFunctionLocation(%s): %v", f, l, fname, err)
+	}
+	return bp
+}
+
+func TestIssue1075(t *testing.T) {
+	withTestProcess("clientdo", t, func(p proc.Process, fixture protest.Fixture) {
+		setFunctionBreakpoint(p, t, "net/http.(*Client).Do")
+		assertNoError(proc.Continue(p), t, "Continue()")
+		for i := 0; i < 10; i++ {
+			scope, err := proc.GoroutineScope(p.CurrentThread())
+			assertNoError(err, t, fmt.Sprintf("GoroutineScope (%d)", i))
+			vars, err := scope.LocalVariables(pnormalLoadConfig)
+			assertNoError(err, t, fmt.Sprintf("LocalVariables (%d)", i))
+			for _, v := range vars {
+				api.ConvertVar(v).SinglelineString()
+			}
+		}
+	})
+}
+
+type testCaseCallFunction struct {
+	expr string   // call expression to evaluate
+	outs []string // list of return parameters in this format: <param name>:<param type>:<param value>
+	err  error    // if not nil should return an error
+}
+
+func TestCallFunction(t *testing.T) {
+	protest.MustSupportFunctionCalls(t, testBackend)
+
+	var testcases = []testCaseCallFunction{
+		// Basic function call injection tests
+
+		{"call1(one, two)", []string{":int:3"}, nil},
+		{"call1(one+two, 4)", []string{":int:7"}, nil},
+		{"callpanic()", []string{`~panic:interface {}:interface {}(string) "callpanic panicked"`}, nil},
+		{`stringsJoin(nil, "")`, []string{`:string:""`}, nil},
+		{`stringsJoin(stringslice, comma)`, []string{`:string:"one,two,three"`}, nil},
+		{`stringsJoin(s1, comma)`, nil, errors.New(`error evaluating "s1" as argument v in function main.stringsJoin: could not find symbol value for s1`)},
+		{`stringsJoin(intslice, comma)`, nil, errors.New("can not convert value of type []int to []string")},
+		{`noreturncall(2)`, nil, nil},
+
+		// Expression tests
+		{`square(2) + 1`, []string{":int:5"}, nil},
+		{`intcallpanic(1) + 1`, []string{":int:2"}, nil},
+		{`intcallpanic(0) + 1`, []string{`~panic:interface {}:interface {}(string) "panic requested"`}, nil},
+		{`onetwothree(5)[1] + 2`, []string{":int:9"}, nil},
+
+		// Call types tests (methods, function pointers, etc.)
+		// The following set of calls was constructed using https://docs.google.com/document/d/1bMwCey-gmqZVTpRax-ESeVuZGmjwbocYs1iHplK-cjo/pub as a reference
+
+		{`a.VRcvr(1)`, []string{`:string:"1 + 3 = 4"`}, nil}, // direct call of a method with value receiver / on a value
+
+		{`a.PRcvr(2)`, []string{`:string:"2 - 3 = -1"`}, nil},  // direct call of a method with pointer receiver / on a value
+		{`pa.VRcvr(3)`, []string{`:string:"3 + 6 = 9"`}, nil},  // direct call of a method with value receiver / on a pointer
+		{`pa.PRcvr(4)`, []string{`:string:"4 - 6 = -2"`}, nil}, // direct call of a method with pointer receiver / on a pointer
+
+		{`vable_pa.VRcvr(6)`, []string{`:string:"6 + 6 = 12"`}, nil}, // indirect call of method on interface / containing value with value method
+		{`pable_pa.PRcvr(7)`, []string{`:string:"7 - 6 = 1"`}, nil},  // indirect call of method on interface / containing pointer with value method
+		{`vable_a.VRcvr(5)`, []string{`:string:"5 + 3 = 8"`}, nil},   // indirect call of method on interface / containing pointer with pointer method
+
+		{`pa.nonexistent()`, nil, errors.New("pa has no member nonexistent")},
+		{`a.nonexistent()`, nil, errors.New("a has no member nonexistent")},
+		{`vable_pa.nonexistent()`, nil, errors.New("vable_pa has no member nonexistent")},
+		{`vable_a.nonexistent()`, nil, errors.New("vable_a has no member nonexistent")},
+		{`pable_pa.nonexistent()`, nil, errors.New("pable_pa has no member nonexistent")},
+
+		{`fn2glob(10, 20)`, []string{":int:30"}, nil},               // indirect call of func value / set to top-level func
+		{`fn2clos(11)`, []string{`:string:"1 + 6 + 11 = 18"`}, nil}, // indirect call of func value / set to func literal
+		{`fn2clos(12)`, []string{`:string:"2 + 6 + 12 = 20"`}, nil},
+		{`fn2valmeth(13)`, []string{`:string:"13 + 6 = 19"`}, nil}, // indirect call of func value / set to value method
+		{`fn2ptrmeth(14)`, []string{`:string:"14 - 6 = 8"`}, nil},  // indirect call of func value / set to pointer method
+
+		{"fn2nil()", nil, errors.New("nil pointer dereference")},
+
+		{"ga.PRcvr(2)", []string{`:string:"2 - 0 = 2"`}, nil},
+
+		// Nested function calls tests
+
+		{`onetwothree(intcallpanic(2))`, []string{`:[]int:[]int len: 3, cap: 3, [3,4,5]`}, nil},
+		{`onetwothree(intcallpanic(0))`, []string{`~panic:interface {}:interface {}(string) "panic requested"`}, nil},
+		{`onetwothree(intcallpanic(2)+1)`, []string{`:[]int:[]int len: 3, cap: 3, [4,5,6]`}, nil},
+		{`onetwothree(intcallpanic("not a number"))`, nil, errors.New("can not convert \"not a number\" constant to int")},
+
+		// Variable setting tests
+		{`pa2 = getAStructPtr(8); pa2`, []string{`pa2:*main.astruct:*main.astruct {X: 8}`}, nil},
+
+		// Escape tests
+
+		{"escapeArg(&a2)", nil, errors.New("cannot use &a2 as argument pa2 in function main.escapeArg: stack object passed to escaping pointer: pa2")},
+
+		// Issue 1577
+		{"1+2", []string{`::3`}, nil},
+		{`"de"+"mo"`, []string{`::"demo"`}, nil},
+	}
+
+	var testcases112 = []testCaseCallFunction{
+		// string allocation requires trusted argument order, which we don't have in Go 1.11
+		{`stringsJoin(stringslice, ",")`, []string{`:string:"one,two,three"`}, nil},
+		{`str = "a new string"; str`, []string{`str:string:"a new string"`}, nil},
+
+		// support calling optimized functions
+		{`strings.Join(nil, "")`, []string{`:string:""`}, nil},
+		{`strings.Join(stringslice, comma)`, []string{`:string:"one,two,three"`}, nil},
+		{`strings.Join(s1, comma)`, nil, errors.New(`error evaluating "s1" as argument a in function strings.Join: could not find symbol value for s1`)},
+		{`strings.Join(intslice, comma)`, nil, errors.New("can not convert value of type []int to []string")},
+		{`strings.Join(stringslice, ",")`, []string{`:string:"one,two,three"`}, nil},
+		{`strings.LastIndexByte(stringslice[1], 'w')`, []string{":int:1"}, nil},
+		{`strings.LastIndexByte(stringslice[1], 'o')`, []string{":int:2"}, nil},
+		{`d.Base.Method()`, []string{ `:int:4` }, nil },
+		{`d.Method()`, []string{ `:int:4` }, nil },
+	}
+
+	var testcases113 = []testCaseCallFunction{
+		{`curriedAdd(2)(3)`, []string{`:int:5`}, nil},
+
+		// Method calls on a value returned by a function
+
+		{`getAStruct(3).VRcvr(1)`, []string{`:string:"1 + 3 = 4"`}, nil}, // direct call of a method with value receiver / on a value
+
+		{`getAStruct(3).PRcvr(2)`, nil, errors.New("cannot use getAStruct(3).PRcvr as argument pa in function main.(*astruct).PRcvr: stack object passed to escaping pointer: pa")}, // direct call of a method with pointer receiver / on a value
+		{`getAStructPtr(6).VRcvr(3)`, []string{`:string:"3 + 6 = 9"`}, nil},  // direct call of a method with value receiver / on a pointer
+		{`getAStructPtr(6).PRcvr(4)`, []string{`:string:"4 - 6 = -2"`}, nil}, // direct call of a method with pointer receiver / on a pointer
+
+		{`getVRcvrableFromAStruct(3).VRcvr(6)`, []string{`:string:"6 + 3 = 9"`}, nil},     // indirect call of method on interface / containing value with value method
+		{`getPRcvrableFromAStructPtr(6).PRcvr(7)`, []string{`:string:"7 - 6 = 1"`}, nil},  // indirect call of method on interface / containing pointer with value method
+		{`getVRcvrableFromAStructPtr(6).VRcvr(5)`, []string{`:string:"5 + 6 = 11"`}, nil}, // indirect call of method on interface / containing pointer with pointer method
+	}
+
+	withTestProcess("fncall", t, func(p proc.Process, fixture protest.Fixture) {
+		_, err := proc.FindFunctionLocation(p, "runtime.debugCallV1", 0)
+		if err != nil {
+			t.Skip("function calls not supported on this version of go")
+		}
+		assertNoError(proc.Continue(p), t, "Continue()")
+		for _, tc := range testcases {
+			testCallFunction(t, p, tc)
+		}
+
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 12) {
+			for _, tc := range testcases112 {
+				testCallFunction(t, p, tc)
+			}
+		}
+
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 13) {
+			for _, tc := range testcases113 {
+				testCallFunction(t, p, tc)
+			}
+		}
+
+		// LEAVE THIS AS THE LAST ITEM, IT BREAKS THE TARGET PROCESS!!!
+		testCallFunction(t, p, testCaseCallFunction{"-unsafe escapeArg(&a2)", nil, nil})
+	})
+}
+
+func testCallFunction(t *testing.T, p proc.Process, tc testCaseCallFunction) {
+	const unsafePrefix = "-unsafe "
+
+	var callExpr, varExpr string
+
+	if semicolon := strings.Index(tc.expr, ";"); semicolon >= 0 {
+		callExpr = tc.expr[:semicolon]
+		varExpr = tc.expr[semicolon+1:]
+	} else {
+		callExpr = tc.expr
+	}
+
+	checkEscape := true
+	if strings.HasPrefix(callExpr, unsafePrefix) {
+		callExpr = callExpr[len(unsafePrefix):]
+		checkEscape = false
+	}
+	t.Logf("call %q", tc.expr)
+	err := proc.EvalExpressionWithCalls(p, p.SelectedGoroutine(), callExpr, pnormalLoadConfig, checkEscape)
+	if tc.err != nil {
+		t.Logf("\terr = %v\n", err)
+		if err == nil {
+			t.Fatalf("call %q: expected error %q, got no error", tc.expr, tc.err.Error())
+		}
+		if tc.err.Error() != err.Error() {
+			t.Fatalf("call %q: expected error %q, got %q", tc.expr, tc.err.Error(), err.Error())
+		}
+		return
+	}
+
+	if err != nil {
+		t.Fatalf("call %q: error %q", tc.expr, err.Error())
+	}
+
+	retvalsVar := p.CurrentThread().Common().ReturnValues(pnormalLoadConfig)
+	retvals := make([]*api.Variable, len(retvalsVar))
+
+	for i := range retvals {
+		retvals[i] = api.ConvertVar(retvalsVar[i])
+	}
+
+	if varExpr != "" {
+		scope, err := proc.GoroutineScope(p.CurrentThread())
+		assertNoError(err, t, "GoroutineScope")
+		v, err := scope.EvalExpression(varExpr, pnormalLoadConfig)
+		assertNoError(err, t, fmt.Sprintf("EvalExpression(%s)", varExpr))
+		retvals = append(retvals, api.ConvertVar(v))
+	}
+
+	for i := range retvals {
+		t.Logf("\t%s = %s", retvals[i].Name, retvals[i].SinglelineString())
+	}
+
+	if len(retvals) != len(tc.outs) {
+		t.Fatalf("call %q: wrong number of return parameters", tc.expr)
+	}
+
+	for i := range retvals {
+		outfields := strings.SplitN(tc.outs[i], ":", 3)
+		tgtName, tgtType, tgtValue := outfields[0], outfields[1], outfields[2]
+
+		if tgtName != "" && tgtName != retvals[i].Name {
+			t.Fatalf("call %q output parameter %d: expected name %q, got %q", tc.expr, i, tgtName, retvals[i].Name)
+		}
+
+		if retvals[i].Type != tgtType {
+			t.Fatalf("call %q, output parameter %d: expected type %q, got %q", tc.expr, i, tgtType, retvals[i].Type)
+		}
+		if cvs := retvals[i].SinglelineString(); cvs != tgtValue {
+			t.Fatalf("call %q, output parameter %d: expected value %q, got %q", tc.expr, i, tgtValue, cvs)
+		}
+	}
+}
+
+func TestIssue1531(t *testing.T) {
+	// Go 1.12 introduced a change to the map representation where empty cells can be marked with 1 instead of just 0.
+	withTestProcess("issue1531", t, func(p proc.Process, fixture protest.Fixture) {
+		assertNoError(proc.Continue(p), t, "Continue()")
+
+		hasKeys := func(mv *proc.Variable, keys ...string) {
+			n := 0
+			for i := 0; i < len(mv.Children); i += 2 {
+				cv := &mv.Children[i]
+				s := constant.StringVal(cv.Value)
+				found := false
+				for j := range keys {
+					if keys[j] == s {
+						found = true
+						break
+					}
+				}
+				if !found {
+					t.Errorf("key %q not allowed", s)
+					return
+				}
+				n++
+			}
+			if n != len(keys) {
+				t.Fatalf("wrong number of keys found")
+			}
+		}
+
+		mv, err := evalVariable(p, "m", pnormalLoadConfig)
+		assertNoError(err, t, "EvalVariable(m)")
+		cmv := api.ConvertVar(mv)
+		t.Logf("m = %s", cmv.SinglelineString())
+		hasKeys(mv, "s", "r", "v")
+
+		mmv, err := evalVariable(p, "mm", pnormalLoadConfig)
+		assertNoError(err, t, "EvalVariable(mm)")
+		cmmv := api.ConvertVar(mmv)
+		t.Logf("mm = %s", cmmv.SinglelineString())
+		hasKeys(mmv, "r", "t", "v")
+	})
+}
+
+func setFileBreakpoint(p proc.Process, t *testing.T, fixture protest.Fixture, lineno int) *proc.Breakpoint {
+	_, f, l, _ := runtime.Caller(1)
+	f = filepath.Base(f)
+
+	addr, err := proc.FindFileLocation(p, fixture.Source, lineno)
+	if err != nil {
+		t.Fatalf("%s:%d: FindFileLocation(%s, %d): %v", f, l, fixture.Source, lineno, err)
+	}
+	bp, err := p.SetBreakpoint(addr, proc.UserBreakpoint, nil)
+	if err != nil {
+		t.Fatalf("%s:%d: SetBreakpoint: %v", f, l, err)
+	}
+	return bp
+}
+
+func currentLocation(p proc.Process, t *testing.T) (pc uint64, f string, ln int, fn *proc.Function) {
+	regs, err := p.CurrentThread().Registers(false)
+	if err != nil {
+		t.Fatalf("Registers error: %v", err)
+	}
+	f, l, fn := p.BinInfo().PCToLine(regs.PC())
+	t.Logf("at %#x %s:%d %v", regs.PC(), f, l, fn)
+	return regs.PC(), f, l, fn
+}
+
+func assertCurrentLocationFunction(p proc.Process, t *testing.T, fnname string) {
+	_, _, _, fn := currentLocation(p, t)
+	if fn == nil {
+		t.Fatalf("Not in a function")
+	}
+	if fn.Name != fnname {
+		t.Fatalf("Wrong function %s %s", fn.Name, fnname)
+	}
+}
+
+func TestPluginVariables(t *testing.T) {
+	pluginFixtures := protest.WithPlugins(t, protest.AllNonOptimized, "plugin1/", "plugin2/")
+
+	withTestProcessArgs("plugintest2", t, ".", []string{pluginFixtures[0].Path, pluginFixtures[1].Path}, protest.AllNonOptimized, func(p proc.Process, fixture protest.Fixture) {
+		setFileBreakpoint(p, t, fixture, 41)
+		assertNoError(proc.Continue(p), t, "Continue 1")
+
+		bp := setFunctionBreakpoint(p, t, "github.com/go-delve/delve/_fixtures/plugin2.TypesTest")
+		t.Logf("bp.Addr = %#x", bp.Addr)
+		setFunctionBreakpoint(p, t, "github.com/go-delve/delve/_fixtures/plugin2.aIsNotNil")
+
+		for _, image := range p.BinInfo().Images {
+			t.Logf("%#x %s\n", image.StaticBase, image.Path)
+		}
+
+		assertNoError(proc.Continue(p), t, "Continue 2")
+
+		// test that PackageVariables returns variables from the executable and plugins
+		scope, err := evalScope(p)
+		assertNoError(err, t, "evalScope")
+		allvars, err := scope.PackageVariables(pnormalLoadConfig)
+		assertNoError(err, t, "PackageVariables")
+		var plugin2AFound, mainExeGlobalFound bool
+		for _, v := range allvars {
+			switch v.Name {
+			case "github.com/go-delve/delve/_fixtures/plugin2.A":
+				plugin2AFound = true
+			case "main.ExeGlobal":
+				mainExeGlobalFound = true
+			}
+		}
+		if !plugin2AFound {
+			t.Fatalf("variable plugin2.A not found in the output of PackageVariables")
+		}
+		if !mainExeGlobalFound {
+			t.Fatalf("variable main.ExeGlobal not found in the output of PackageVariables")
+		}
+
+		// read interface variable, inside plugin code, with a concrete type defined in the executable
+		vs, err := evalVariable(p, "s", pnormalLoadConfig)
+		assertNoError(err, t, "Eval(s)")
+		assertVariable(t, vs, varTest{"s", true, `github.com/go-delve/delve/_fixtures/internal/pluginsupport.Something(*main.asomething) *{n: 2}`, ``, `github.com/go-delve/delve/_fixtures/internal/pluginsupport.Something`, nil})
+
+		// test that the concrete type -> interface{} conversion works across plugins (mostly tests proc.dwarfToRuntimeType)
+		assertNoError(setVariable(p, "plugin2.A", "main.ExeGlobal"), t, "setVariable(plugin2.A = main.ExeGlobal)")
+		assertNoError(proc.Continue(p), t, "Continue 3")
+		assertCurrentLocationFunction(p, t, "github.com/go-delve/delve/_fixtures/plugin2.aIsNotNil")
+		vstr, err := evalVariable(p, "str", pnormalLoadConfig)
+		assertNoError(err, t, "Eval(str)")
+		assertVariable(t, vstr, varTest{"str", true, `"success"`, ``, `string`, nil})
+
+		assertNoError(proc.StepOut(p), t, "StepOut")
+		assertNoError(proc.StepOut(p), t, "StepOut")
+		assertNoError(proc.Next(p), t, "Next")
+
+		// read interface variable, inside executable code, with a concrete type defined in a plugin
+		vb, err := evalVariable(p, "b", pnormalLoadConfig)
+		assertNoError(err, t, "Eval(b)")
+		assertVariable(t, vb, varTest{"b", true, `github.com/go-delve/delve/_fixtures/internal/pluginsupport.SomethingElse(*github.com/go-delve/delve/_fixtures/plugin2.asomethingelse) *{x: 1, y: 4}`, ``, `github.com/go-delve/delve/_fixtures/internal/pluginsupport.SomethingElse`, nil})
 	})
 }

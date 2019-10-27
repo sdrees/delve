@@ -5,7 +5,8 @@ Delve can evaluate a subset of go expression language, specifically the followin
 - All (binary and unary) on basic types except <-, ++ and --
 - Comparison operators on any type
 - Type casts between numeric types
-- Type casts of integer constants into any pointer type
+- Type casts of integer constants into any pointer type and vice versa
+- Type casts between string, []byte and []rune
 - Struct member access (i.e. `somevar.memberfield`)
 - Slicing and indexing operators on arrays, slices and strings
 - Map access
@@ -74,9 +75,32 @@ interface {}(*struct string) *"test"
 error(*struct main.astruct) *{A: 1, B: 2}
 ```
 
-To use a field of a struct contained inside an interface variable use a type assertion:
+To use the contents of an interface variable use a type assertion:
 
 ```
 (dlv) p iface1.(*main.astruct).B
 2
+```
+
+Or just use the special `.(data)` type assertion:
+
+```
+(dlv) p iface1.(data).B
+2
+```
+
+If the contents of the interface variable are a struct or a pointer to struct the fields can also be accessed directly:
+
+```
+(dlv) p iface1.B
+2
+```
+
+# Specifying package paths
+
+Packages with the same name can be disambiguated by using the full package path. For example, if the application imports two packages, `some/package` and `some/other/package`, both defining a variable `A`, the two variables can be accessed using this syntax:
+
+```
+(dlv) p "some/package".A
+(dlv) p "some/other/package".A
 ```

@@ -3,24 +3,45 @@ package terminal
 import (
 	"fmt"
 	"io"
+	"net/rpc"
 	"os"
 	"os/signal"
 	"runtime"
 	"strings"
-
+	"sync"
 	"syscall"
 
 	"github.com/peterh/liner"
 
-	"github.com/derekparker/delve/pkg/config"
-	"github.com/derekparker/delve/service"
-	"github.com/derekparker/delve/service/api"
+	"github.com/go-delve/delve/pkg/config"
+	"github.com/go-delve/delve/pkg/terminal/starbind"
+	"github.com/go-delve/delve/service"
+	"github.com/go-delve/delve/service/api"
 )
 
 const (
-	historyFile             string = ".dbg_history"
-	terminalBlueEscapeCode  string = "\033[34m"
-	terminalResetEscapeCode string = "\033[0m"
+	historyFile                 string = ".dbg_history"
+	terminalHighlightEscapeCode string = "\033[%2dm"
+	terminalResetEscapeCode     string = "\033[0m"
+)
+
+const (
+	ansiBlack     = 30
+	ansiRed       = 31
+	ansiGreen     = 32
+	ansiYellow    = 33
+	ansiBlue      = 34
+	ansiMagenta   = 35
+	ansiCyan      = 36
+	ansiWhite     = 37
+	ansiBrBlack   = 90
+	ansiBrRed     = 91
+	ansiBrGreen   = 92
+	ansiBrYellow  = 93
+	ansiBrBlue    = 94
+	ansiBrMagenta = 95
+	ansiBrCyan    = 96
+	ansiBrWhite   = 97
 )
 
 // Term represents the terminal running dlv.
@@ -33,6 +54,15 @@ type Term struct {
 	dumb     bool
 	stdout   io.Writer
 	InitFile string
+
+	starlarkEnv *starbind.Env
+
+	// quitContinue is set to true by exitCommand to signal that the process
+	// should be resumed before quitting.
+	quitContinue bool
+
+	quittingMutex sync.Mutex
+	quitting      bool
 }
 
 // New returns a new Term.
@@ -40,6 +70,10 @@ func New(client service.Client, conf *config.Config) *Term {
 	cmds := DebugCommands(client)
 	if conf != nil && conf.Aliases != nil {
 		cmds.Merge(conf.Aliases)
+	}
+
+	if conf == nil {
+		conf = &config.Config{}
 	}
 
 	var w io.Writer
@@ -51,7 +85,14 @@ func New(client service.Client, conf *config.Config) *Term {
 		w = getColorableWriter()
 	}
 
-	return &Term{
+	if (conf.SourceListLineColor > ansiWhite &&
+		conf.SourceListLineColor < ansiBrBlack) ||
+		conf.SourceListLineColor < ansiBlack ||
+		conf.SourceListLineColor > ansiBrWhite {
+		conf.SourceListLineColor = ansiBlue
+	}
+
+	t := &Term{
 		client: client,
 		conf:   conf,
 		prompt: "(dlv) ",
@@ -60,6 +101,14 @@ func New(client service.Client, conf *config.Config) *Term {
 		dumb:   dumb,
 		stdout: w,
 	}
+
+	if client != nil {
+		lcfg := t.loadConfig()
+		client.SetReturnValuesLoadConfig(&lcfg)
+	}
+
+	t.starlarkEnv = starbind.New(starlarkContext{t})
+	return t
 }
 
 // Close returns the terminal to its previous mode.
@@ -67,24 +116,66 @@ func (t *Term) Close() {
 	t.line.Close()
 }
 
-// Run begins running dlv in the terminal.
-func (t *Term) Run() (int, error) {
-	defer t.Close()
+func (t *Term) sigintGuard(ch <-chan os.Signal, multiClient bool) {
+	for range ch {
+		t.starlarkEnv.Cancel()
+		if multiClient {
+			answer, err := t.line.Prompt("Would you like to [s]top the target or [q]uit this client, leaving the target running [s/q]? ")
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "%v", err)
+				continue
+			}
+			answer = strings.TrimSpace(answer)
+			switch answer {
+			case "s":
+				_, err := t.client.Halt()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v", err)
+				}
+			case "q":
+				t.quittingMutex.Lock()
+				t.quitting = true
+				t.quittingMutex.Unlock()
+				err := t.client.Disconnect(false)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "%v", err)
+				} else {
+					t.Close()
+				}
+			default:
+				fmt.Println("only s or q allowed")
+			}
 
-	// Send the debugger a halt command on SIGINT
-	ch := make(chan os.Signal)
-	signal.Notify(ch, syscall.SIGINT)
-	go func() {
-		for range ch {
-			fmt.Printf("received SIGINT, stopping process (will not forward signal)")
+		} else {
+			fmt.Printf("received SIGINT, stopping process (will not forward signal)\n")
 			_, err := t.client.Halt()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v", err)
 			}
 		}
-	}()
+	}
+}
+
+// Run begins running dlv in the terminal.
+func (t *Term) Run() (int, error) {
+	defer t.Close()
+
+	multiClient := t.client.IsMulticlient()
+
+	// Send the debugger a halt command on SIGINT
+	ch := make(chan os.Signal)
+	signal.Notify(ch, syscall.SIGINT)
+	go t.sigintGuard(ch, multiClient)
 
 	t.line.SetCompleter(func(line string) (c []string) {
+		if strings.HasPrefix(line, "break ") || strings.HasPrefix(line, "b ") {
+			filter := line[strings.Index(line, " ")+1:]
+			funcs, _ := t.client.ListFunctions(filter)
+			for _, f := range funcs {
+				c = append(c, "break "+f)
+			}
+			return
+		}
 		for _, cmd := range t.cmds.cmds {
 			for _, alias := range cmd.aliases {
 				if strings.HasPrefix(alias, strings.ToLower(line)) {
@@ -115,6 +206,9 @@ func (t *Term) Run() (int, error) {
 	if t.InitFile != "" {
 		err := t.cmds.executeFile(t, t.InitFile)
 		if err != nil {
+			if _, ok := err.(ExitRequestError); ok {
+				return t.handleExit()
+			}
 			fmt.Fprintf(os.Stderr, "Error executing init file: %s\n", err)
 		}
 	}
@@ -139,6 +233,12 @@ func (t *Term) Run() (int, error) {
 			if strings.Contains(err.Error(), "exited") {
 				fmt.Fprintln(os.Stderr, err.Error())
 			} else {
+				t.quittingMutex.Lock()
+				quitting := t.quitting
+				t.quittingMutex.Unlock()
+				if quitting {
+					return t.handleExit()
+				}
 				fmt.Fprintf(os.Stderr, "Command failed: %s\n", err)
 			}
 		}
@@ -148,14 +248,15 @@ func (t *Term) Run() (int, error) {
 // Println prints a line to the terminal.
 func (t *Term) Println(prefix, str string) {
 	if !t.dumb {
-		prefix = fmt.Sprintf("%s%s%s", terminalBlueEscapeCode, prefix, terminalResetEscapeCode)
+		terminalColorEscapeCode := fmt.Sprintf(terminalHighlightEscapeCode, t.conf.SourceListLineColor)
+		prefix = fmt.Sprintf("%s%s%s", terminalColorEscapeCode, prefix, terminalResetEscapeCode)
 	}
 	fmt.Fprintf(t.stdout, "%s%s\n", prefix, str)
 }
 
-// Substitues directory to source file.
+// Substitutes directory to source file.
 //
-// Ensures that only directory is substitued, for example:
+// Ensures that only directory is substituted, for example:
 // substitute from `/dir/subdir`, substitute to `/new`
 // for file path `/dir/subdir/file` will return file path `/new/file`.
 // for file path `/dir/subdir-2/file` substitution will not be applied.
@@ -168,7 +269,14 @@ func (t *Term) substitutePath(path string) string {
 	if t.conf == nil {
 		return path
 	}
-	separator := string(os.PathSeparator)
+
+	// On windows paths returned from headless server are as c:/dir/dir
+	// though os.PathSeparator is '\\'
+
+	separator := "/"                     //make it default
+	if strings.Index(path, "\\") != -1 { //dependent on the path
+		separator = "\\"
+	}
 	for _, r := range t.conf.SubstitutePath {
 		from := crossPlatformPath(r.From)
 		to := r.To
@@ -187,7 +295,7 @@ func (t *Term) substitutePath(path string) string {
 }
 
 func crossPlatformPath(path string) string {
-	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
+	if runtime.GOOS == "windows" {
 		return strings.ToLower(path)
 	}
 	return path
@@ -207,6 +315,22 @@ func (t *Term) promptForInput() (string, error) {
 	return l, nil
 }
 
+func yesno(line *liner.State, question string) (bool, error) {
+	for {
+		answer, err := line.Prompt(question)
+		if err != nil {
+			return false, err
+		}
+		answer = strings.ToLower(strings.TrimSpace(answer))
+		switch answer {
+		case "n", "no":
+			return false, nil
+		case "y", "yes":
+			return true, nil
+		}
+	}
+}
+
 func (t *Term) handleExit() (int, error) {
 	fullHistoryFile, err := config.GetConfigFilePath(historyFile)
 	if err != nil {
@@ -221,22 +345,59 @@ func (t *Term) handleExit() (int, error) {
 		}
 	}
 
+	t.quittingMutex.Lock()
+	quitting := t.quitting
+	t.quittingMutex.Unlock()
+	if quitting {
+		return 0, nil
+	}
+
 	s, err := t.client.GetState()
 	if err != nil {
-		return 1, err
-	}
-	if !s.Exited {
-		kill := true
-		if t.client.AttachedToExistingProcess() {
-			answer, err := t.line.Prompt("Would you like to kill the process? [Y/n] ")
+		if isErrProcessExited(err) && t.client.IsMulticlient() {
+			answer, err := yesno(t.line, "Remote process has exited. Would you like to kill the headless instance? [Y/n] ")
 			if err != nil {
 				return 2, io.EOF
 			}
-			answer = strings.ToLower(strings.TrimSpace(answer))
-			kill = (answer != "n" && answer != "no")
+			if answer {
+				if err := t.client.Detach(true); err != nil {
+					return 1, err
+				}
+			}
+			return 0, err
 		}
-		if err := t.client.Detach(kill); err != nil {
-			return 1, err
+		return 1, err
+	}
+	if !s.Exited {
+		if t.quitContinue {
+			err := t.client.Disconnect(true)
+			if err != nil {
+				return 2, err
+			}
+			return 0, nil
+		}
+
+		doDetach := true
+		if t.client.IsMulticlient() {
+			answer, err := yesno(t.line, "Would you like to kill the headless instance? [Y/n] ")
+			if err != nil {
+				return 2, io.EOF
+			}
+			doDetach = answer
+		}
+
+		if doDetach {
+			kill := true
+			if t.client.AttachedToExistingProcess() {
+				answer, err := yesno(t.line, "Would you like to kill the process? [Y/n] ")
+				if err != nil {
+					return 2, io.EOF
+				}
+				kill = answer
+			}
+			if err := t.client.Detach(kill); err != nil {
+				return 1, err
+			}
 		}
 	}
 	return 0, nil
@@ -247,12 +408,21 @@ func (t *Term) handleExit() (int, error) {
 func (t *Term) loadConfig() api.LoadConfig {
 	r := api.LoadConfig{true, 1, 64, 64, -1}
 
-	if t.conf.MaxStringLen != nil {
+	if t.conf != nil && t.conf.MaxStringLen != nil {
 		r.MaxStringLen = *t.conf.MaxStringLen
 	}
-	if t.conf.MaxArrayValues != nil {
+	if t.conf != nil && t.conf.MaxArrayValues != nil {
 		r.MaxArrayValues = *t.conf.MaxArrayValues
+	}
+	if t.conf != nil && t.conf.MaxVariableRecurse != nil {
+		r.MaxVariableRecurse = *t.conf.MaxVariableRecurse
 	}
 
 	return r
+}
+
+// isErrProcessExited returns true if `err` is an RPC error equivalent of proc.ErrProcessExited
+func isErrProcessExited(err error) bool {
+	rpcError, ok := err.(rpc.ServerError)
+	return ok && strings.Contains(rpcError.Error(), "has exited with status")
 }

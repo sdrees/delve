@@ -6,18 +6,19 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/derekparker/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc"
 )
 
 // Process represents all of the information the debugger
 // is holding onto regarding the process we are debugging.
 type Process struct {
-	bi  proc.BinaryInfo
+	bi *proc.BinaryInfo
+
 	pid int // Process Pid
 
 	// Breakpoint table, holds information on breakpoints.
 	// Maps instruction address to Breakpoint struct.
-	breakpoints map[uint64]*proc.Breakpoint
+	breakpoints proc.BreakpointMap
 
 	// List of threads mapped as such: pid -> *Thread
 	threads map[int]*Thread
@@ -29,19 +30,17 @@ type Process struct {
 	// Normally selectedGoroutine is currentThread.GetG, it will not be only if SwitchGoroutine is called with a goroutine that isn't attached to a thread
 	selectedGoroutine *proc.G
 
-	allGCache                   []*proc.G
-	os                          *OSProcessDetails
-	breakpointIDCounter         int
-	internalBreakpointIDCounter int
-	firstStart                  bool
-	haltMu                      sync.Mutex
-	halt                        bool
-	resumeChan                  chan<- struct{}
-	exited                      bool
-	ptraceChan                  chan func()
-	ptraceDoneChan              chan interface{}
-	childProcess                bool // this process was launched, not attached to
-	manualStopRequested         bool
+	common              proc.CommonProcess
+	os                  *OSProcessDetails
+	firstStart          bool
+	stopMu              sync.Mutex
+	resumeChan          chan<- struct{}
+	ptraceChan          chan func()
+	ptraceDoneChan      chan interface{}
+	childProcess        bool // this process was launched, not attached to
+	manualStopRequested bool
+
+	exited, detached bool
 }
 
 // New returns an initialized Process struct. Before returning,
@@ -52,7 +51,7 @@ func New(pid int) *Process {
 	dbp := &Process{
 		pid:            pid,
 		threads:        make(map[int]*Thread),
-		breakpoints:    make(map[uint64]*proc.Breakpoint),
+		breakpoints:    proc.NewBreakpointMap(),
 		firstStart:     true,
 		os:             new(OSProcessDetails),
 		ptraceChan:     make(chan func()),
@@ -63,17 +62,36 @@ func New(pid int) *Process {
 	return dbp
 }
 
+// BinInfo will return the binary info struct associated with this process.
 func (dbp *Process) BinInfo() *proc.BinaryInfo {
-	return &dbp.bi
+	return dbp.bi
 }
 
-func (dbp *Process) Recorded() (bool, string)                { return false, "" }
-func (dbp *Process) Restart(string) error                    { return proc.NotRecordedErr }
-func (dbp *Process) Direction(proc.Direction) error          { return proc.NotRecordedErr }
-func (dbp *Process) When() (string, error)                   { return "", nil }
-func (dbp *Process) Checkpoint(string) (int, error)          { return -1, proc.NotRecordedErr }
-func (dbp *Process) Checkpoints() ([]proc.Checkpoint, error) { return nil, proc.NotRecordedErr }
-func (dbp *Process) ClearCheckpoint(int) error               { return proc.NotRecordedErr }
+// Recorded always returns false for the native proc backend.
+func (dbp *Process) Recorded() (bool, string) { return false, "" }
+
+// Restart will always return an error in the native proc backend, only for
+// recorded traces.
+func (dbp *Process) Restart(string) error { return proc.ErrNotRecorded }
+
+// Direction will always return an error in the native proc backend, only for
+// recorded traces.
+func (dbp *Process) Direction(proc.Direction) error { return proc.ErrNotRecorded }
+
+// When will always return an empty string and nil, not supported on native proc backend.
+func (dbp *Process) When() (string, error) { return "", nil }
+
+// Checkpoint will always return an error on the native proc backend,
+// only supported for recorded traces.
+func (dbp *Process) Checkpoint(string) (int, error) { return -1, proc.ErrNotRecorded }
+
+// Checkpoints will always return an error on the native proc backend,
+// only supported for recorded traces.
+func (dbp *Process) Checkpoints() ([]proc.Checkpoint, error) { return nil, proc.ErrNotRecorded }
+
+// ClearCheckpoint will always return an error on the native proc backend,
+// only supported in recorded traces.
+func (dbp *Process) ClearCheckpoint(int) error { return proc.ErrNotRecorded }
 
 // Detach from the process being debugged, optionally killing it.
 func (dbp *Process) Detach(kill bool) (err error) {
@@ -81,7 +99,7 @@ func (dbp *Process) Detach(kill bool) (err error) {
 		return nil
 	}
 	if kill && dbp.childProcess {
-		err := dbp.Kill()
+		err := dbp.kill()
 		if err != nil {
 			return err
 		}
@@ -90,7 +108,7 @@ func (dbp *Process) Detach(kill bool) (err error) {
 	}
 	if !kill {
 		// Clean up any breakpoints we've set.
-		for _, bp := range dbp.breakpoints {
+		for _, bp := range dbp.breakpoints.M {
 			if bp != nil {
 				_, err := dbp.ClearBreakpoint(bp.Addr)
 				if err != nil {
@@ -108,28 +126,41 @@ func (dbp *Process) Detach(kill bool) (err error) {
 			err = killProcess(dbp.pid)
 		}
 	})
-	dbp.bi.Close()
+	dbp.detached = true
+	dbp.postExit()
 	return
 }
 
-// Exited returns whether the debugged
-// process has exited.
-func (dbp *Process) Exited() bool {
-	return dbp.exited
+// Valid returns whether the process is still attached to and
+// has not exited.
+func (dbp *Process) Valid() (bool, error) {
+	if dbp.detached {
+		return false, &proc.ProcessDetachedError{}
+	}
+	if dbp.exited {
+		return false, &proc.ErrProcessExited{Pid: dbp.Pid()}
+	}
+	return true, nil
 }
 
+// ResumeNotify specifies a channel that will be closed the next time
+// ContinueOnce finishes resuming the target.
 func (dbp *Process) ResumeNotify(ch chan<- struct{}) {
 	dbp.resumeChan = ch
 }
 
+// Pid returns the process ID.
 func (dbp *Process) Pid() int {
 	return dbp.pid
 }
 
+// SelectedGoroutine returns the current selected,
+// active goroutine.
 func (dbp *Process) SelectedGoroutine() *proc.G {
 	return dbp.selectedGoroutine
 }
 
+// ThreadList returns a list of threads in the process.
 func (dbp *Process) ThreadList() []proc.Thread {
 	r := make([]proc.Thread, 0, len(dbp.threads))
 	for _, v := range dbp.threads {
@@ -138,140 +169,89 @@ func (dbp *Process) ThreadList() []proc.Thread {
 	return r
 }
 
+// FindThread attempts to find the thread with the specified ID.
 func (dbp *Process) FindThread(threadID int) (proc.Thread, bool) {
 	th, ok := dbp.threads[threadID]
 	return th, ok
 }
 
+// CurrentThread returns the current selected, active thread.
 func (dbp *Process) CurrentThread() proc.Thread {
 	return dbp.currentThread
 }
 
-func (dbp *Process) Breakpoints() map[uint64]*proc.Breakpoint {
-	return dbp.breakpoints
-}
-
-// LoadInformation finds the executable and then uses it
-// to parse the following information:
-// * Dwarf .debug_frame section
-// * Dwarf .debug_line section
-// * Go symbol table.
-func (dbp *Process) LoadInformation(path string) error {
-	var wg sync.WaitGroup
-
-	path = findExecutable(path, dbp.pid)
-
-	wg.Add(1)
-	go dbp.loadProcessInformation(&wg)
-	err := dbp.bi.LoadBinaryInfo(path, &wg)
-	wg.Wait()
-	if err == nil {
-		err = dbp.bi.LoadError()
-	}
-
-	return err
+// Breakpoints returns a list of breakpoints currently set.
+func (dbp *Process) Breakpoints() *proc.BreakpointMap {
+	return &dbp.breakpoints
 }
 
 // RequestManualStop sets the `halt` flag and
 // sends SIGSTOP to all threads.
 func (dbp *Process) RequestManualStop() error {
 	if dbp.exited {
-		return &proc.ProcessExitedError{Pid: dbp.Pid()}
+		return &proc.ErrProcessExited{Pid: dbp.Pid()}
 	}
-	dbp.haltMu.Lock()
-	defer dbp.haltMu.Unlock()
+	dbp.stopMu.Lock()
+	defer dbp.stopMu.Unlock()
 	dbp.manualStopRequested = true
-	dbp.halt = true
 	return dbp.requestManualStop()
 }
 
-func (dbp *Process) ManualStopRequested() bool {
-	dbp.haltMu.Lock()
+// CheckAndClearManualStopRequest checks if a manual stop has
+// been requested, and then clears that state.
+func (dbp *Process) CheckAndClearManualStopRequest() bool {
+	dbp.stopMu.Lock()
+	defer dbp.stopMu.Unlock()
+
 	msr := dbp.manualStopRequested
 	dbp.manualStopRequested = false
-	dbp.haltMu.Unlock()
+
 	return msr
 }
 
-// SetBreakpoint sets a breakpoint at addr, and stores it in the process wide
-// break point table. Setting a break point must be thread specific due to
-// ptrace actions needing the thread to be in a signal-delivery-stop.
-func (dbp *Process) SetBreakpoint(addr uint64, kind proc.BreakpointKind, cond ast.Expr) (*proc.Breakpoint, error) {
-	tid := dbp.currentThread.ID
-
-	if bp, ok := dbp.FindBreakpoint(addr); ok {
-		return bp, proc.BreakpointExistsError{bp.File, bp.Line, bp.Addr}
-	}
-
+func (dbp *Process) writeBreakpoint(addr uint64) (string, int, *proc.Function, []byte, error) {
 	f, l, fn := dbp.bi.PCToLine(uint64(addr))
-	if fn == nil {
-		return nil, proc.InvalidAddressError{Address: addr}
-	}
 
-	newBreakpoint := &proc.Breakpoint{
-		FunctionName: fn.Name,
-		File:         f,
-		Line:         l,
-		Addr:         addr,
-		Kind:         kind,
-		Cond:         cond,
-		HitCount:     map[int]uint64{},
-	}
-
-	if kind != proc.UserBreakpoint {
-		dbp.internalBreakpointIDCounter++
-		newBreakpoint.ID = dbp.internalBreakpointIDCounter
-	} else {
-		dbp.breakpointIDCounter++
-		newBreakpoint.ID = dbp.breakpointIDCounter
-	}
-
-	thread := dbp.threads[tid]
 	originalData := make([]byte, dbp.bi.Arch.BreakpointSize())
-	_, err := thread.ReadMemory(originalData, uintptr(addr))
+	_, err := dbp.currentThread.ReadMemory(originalData, uintptr(addr))
 	if err != nil {
-		return nil, err
+		return "", 0, nil, nil, err
 	}
-	if err := dbp.writeSoftwareBreakpoint(thread, addr); err != nil {
-		return nil, err
+	if err := dbp.writeSoftwareBreakpoint(dbp.currentThread, addr); err != nil {
+		return "", 0, nil, nil, err
 	}
-	newBreakpoint.OriginalData = originalData
-	dbp.breakpoints[addr] = newBreakpoint
 
-	return newBreakpoint, nil
+	return f, l, fn, originalData, nil
+}
+
+// SetBreakpoint sets a breakpoint at addr, and stores it in the process wide
+// break point table.
+func (dbp *Process) SetBreakpoint(addr uint64, kind proc.BreakpointKind, cond ast.Expr) (*proc.Breakpoint, error) {
+	return dbp.breakpoints.Set(addr, kind, cond, dbp.writeBreakpoint)
 }
 
 // ClearBreakpoint clears the breakpoint at addr.
 func (dbp *Process) ClearBreakpoint(addr uint64) (*proc.Breakpoint, error) {
 	if dbp.exited {
-		return nil, &proc.ProcessExitedError{Pid: dbp.Pid()}
+		return nil, &proc.ErrProcessExited{Pid: dbp.Pid()}
 	}
-	bp, ok := dbp.FindBreakpoint(addr)
-	if !ok {
-		return nil, proc.NoBreakpointError{Addr: addr}
-	}
-
-	if _, err := dbp.currentThread.ClearBreakpoint(bp); err != nil {
-		return nil, err
-	}
-
-	delete(dbp.breakpoints, addr)
-
-	return bp, nil
+	return dbp.breakpoints.Clear(addr, dbp.currentThread.ClearBreakpoint)
 }
 
+// ContinueOnce will continue the target until it stops.
+// This could be the result of a breakpoint or signal.
 func (dbp *Process) ContinueOnce() (proc.Thread, error) {
 	if dbp.exited {
-		return nil, &proc.ProcessExitedError{Pid: dbp.Pid()}
+		return nil, &proc.ErrProcessExited{Pid: dbp.Pid()}
 	}
 
 	if err := dbp.resume(); err != nil {
 		return nil, err
 	}
 
-	dbp.allGCache = nil
+	dbp.common.ClearAllGCache()
 	for _, th := range dbp.threads {
-		th.clearBreakpointState()
+		th.CurrentBreakpoint.Clear()
 	}
 
 	if dbp.resumeChan != nil {
@@ -283,10 +263,7 @@ func (dbp *Process) ContinueOnce() (proc.Thread, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := dbp.Halt(); err != nil {
-		return nil, dbp.exitGuard(err)
-	}
-	if err := dbp.setCurrentBreakpoints(trapthread); err != nil {
+	if err := dbp.stop(trapthread); err != nil {
 		return nil, err
 	}
 	return trapthread, err
@@ -294,7 +271,7 @@ func (dbp *Process) ContinueOnce() (proc.Thread, error) {
 
 // StepInstruction will continue the current thread for exactly
 // one instruction. This method affects only the thread
-// asssociated with the selected goroutine. All other
+// associated with the selected goroutine. All other
 // threads will remain stopped.
 func (dbp *Process) StepInstruction() (err error) {
 	thread := dbp.currentThread
@@ -308,16 +285,16 @@ func (dbp *Process) StepInstruction() (err error) {
 		}
 		thread = dbp.selectedGoroutine.Thread.(*Thread)
 	}
-	dbp.allGCache = nil
+	dbp.common.ClearAllGCache()
 	if dbp.exited {
-		return &proc.ProcessExitedError{Pid: dbp.Pid()}
+		return &proc.ErrProcessExited{Pid: dbp.Pid()}
 	}
-	thread.clearBreakpointState()
+	thread.CurrentBreakpoint.Clear()
 	err = thread.StepInstruction()
 	if err != nil {
 		return err
 	}
-	err = thread.SetCurrentBreakpoint()
+	err = thread.SetCurrentBreakpoint(true)
 	if err != nil {
 		return err
 	}
@@ -330,7 +307,7 @@ func (dbp *Process) StepInstruction() (err error) {
 // SwitchThread changes from current thread to the thread specified by `tid`.
 func (dbp *Process) SwitchThread(tid int) error {
 	if dbp.exited {
-		return &proc.ProcessExitedError{Pid: dbp.Pid()}
+		return &proc.ErrProcessExited{Pid: dbp.Pid()}
 	}
 	if th, ok := dbp.threads[tid]; ok {
 		dbp.currentThread = th
@@ -344,7 +321,7 @@ func (dbp *Process) SwitchThread(tid int) error {
 // running the specified goroutine.
 func (dbp *Process) SwitchGoroutine(gid int) error {
 	if dbp.exited {
-		return &proc.ProcessExitedError{Pid: dbp.Pid()}
+		return &proc.ErrProcessExited{Pid: dbp.Pid()}
 	}
 	g, err := proc.FindGoroutine(dbp, gid)
 	if err != nil {
@@ -361,78 +338,54 @@ func (dbp *Process) SwitchGoroutine(gid int) error {
 	return nil
 }
 
-// Halt stops all threads.
-func (dbp *Process) Halt() (err error) {
-	if dbp.exited {
-		return &proc.ProcessExitedError{Pid: dbp.Pid()}
-	}
-	for _, th := range dbp.threads {
-		if err := th.Halt(); err != nil {
-			return err
+// FindBreakpoint finds the breakpoint for the given pc.
+func (dbp *Process) FindBreakpoint(pc uint64, adjustPC bool) (*proc.Breakpoint, bool) {
+	if adjustPC {
+		// Check to see if address is past the breakpoint, (i.e. breakpoint was hit).
+		if bp, ok := dbp.breakpoints.M[pc-uint64(dbp.bi.Arch.BreakpointSize())]; ok {
+			return bp, true
 		}
 	}
-	return nil
-}
-
-// FindBreakpoint finds the breakpoint for the given pc.
-func (dbp *Process) FindBreakpoint(pc uint64) (*proc.Breakpoint, bool) {
-	// Check to see if address is past the breakpoint, (i.e. breakpoint was hit).
-	if bp, ok := dbp.breakpoints[pc-uint64(dbp.bi.Arch.BreakpointSize())]; ok {
-		return bp, true
-	}
 	// Directly use addr to lookup breakpoint.
-	if bp, ok := dbp.breakpoints[pc]; ok {
+	if bp, ok := dbp.breakpoints.M[pc]; ok {
 		return bp, true
 	}
 	return nil, false
 }
 
-// Returns a new Process struct.
-func initializeDebugProcess(dbp *Process, path string) (*Process, error) {
-	err := dbp.LoadInformation(path)
-	if err != nil {
-		return dbp, err
+// initialize will ensure that all relevant information is loaded
+// so the process is ready to be debugged.
+func (dbp *Process) initialize(path string, debugInfoDirs []string) error {
+	if err := initialize(dbp); err != nil {
+		return err
 	}
-
 	if err := dbp.updateThreadList(); err != nil {
-		return dbp, err
+		return err
 	}
-
-	// selectedGoroutine can not be set correctly by the call to updateThreadList
-	// because without calling SetGStructOffset we can not read the G struct of currentThread
-	// but without calling updateThreadList we can not examine memory to determine
-	// the offset of g struct inside TLS
-	dbp.selectedGoroutine, _ = proc.GetG(dbp.currentThread)
-
-	panicpc, err := proc.FindFunctionLocation(dbp, "runtime.startpanic", true, 0)
-	if err == nil {
-		bp, err := dbp.SetBreakpoint(panicpc, proc.UserBreakpoint, nil)
-		if err == nil {
-			bp.Name = proc.UnrecoveredPanic
-			bp.Variables = []string{"runtime.curg._panic.arg"}
-			bp.ID = -1
-			dbp.breakpointIDCounter--
-		}
-	}
-
-	return dbp, nil
+	return proc.PostInitializationSetup(dbp, path, debugInfoDirs, dbp.writeBreakpoint)
 }
 
+// SetSelectedGoroutine will set internally the goroutine that should be
+// the default for any command executed, the goroutine being actively
+// followed.
+func (dbp *Process) SetSelectedGoroutine(g *proc.G) {
+	dbp.selectedGoroutine = g
+}
+
+// ClearInternalBreakpoints will clear all non-user set breakpoints. These
+// breakpoints are set for internal operations such as 'next'.
 func (dbp *Process) ClearInternalBreakpoints() error {
-	for _, bp := range dbp.breakpoints {
-		if !bp.Internal() {
-			continue
-		}
-		if _, err := dbp.ClearBreakpoint(bp.Addr); err != nil {
+	return dbp.breakpoints.ClearInternalBreakpoints(func(bp *proc.Breakpoint) error {
+		if err := dbp.currentThread.ClearBreakpoint(bp); err != nil {
 			return err
 		}
-	}
-	for i := range dbp.threads {
-		if dbp.threads[i].CurrentBreakpoint != nil && dbp.threads[i].CurrentBreakpoint.Internal() {
-			dbp.threads[i].CurrentBreakpoint = nil
+		for _, thread := range dbp.threads {
+			if thread.CurrentBreakpoint.Breakpoint == bp {
+				thread.CurrentBreakpoint.Clear()
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 func (dbp *Process) handlePtraceFuncs() {
@@ -464,6 +417,8 @@ func (dbp *Process) writeSoftwareBreakpoint(thread *Thread, addr uint64) error {
 	return err
 }
 
-func (dbp *Process) AllGCache() *[]*proc.G {
-	return &dbp.allGCache
+// Common returns common information across Process
+// implementations
+func (dbp *Process) Common() *proc.CommonProcess {
+	return &dbp.common
 }

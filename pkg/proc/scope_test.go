@@ -13,9 +13,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/derekparker/delve/pkg/goversion"
-	"github.com/derekparker/delve/pkg/proc"
-	protest "github.com/derekparker/delve/pkg/proc/test"
+	"github.com/go-delve/delve/pkg/goversion"
+	"github.com/go-delve/delve/pkg/proc"
+	protest "github.com/go-delve/delve/pkg/proc/test"
 )
 
 func TestScopeWithEscapedVariable(t *testing.T) {
@@ -30,14 +30,13 @@ func TestScopeWithEscapedVariable(t *testing.T) {
 		// isn't shadowed is a variable that escapes to the heap and figures in
 		// debug_info as '&a'. Evaluating 'a' should yield the escaped variable.
 
-		avar, err := evalVariable(p, "a")
-		assertNoError(err, t, "EvalVariable(a)")
+		avar := evalVariable(p, t, "a")
 		if aval, _ := constant.Int64Val(avar.Value); aval != 3 {
 			t.Errorf("wrong value for variable a: %d", aval)
 		}
 
 		if avar.Flags&proc.VariableEscaped == 0 {
-			t.Errorf("variale a isn't escaped to the heap")
+			t.Errorf("variable a isn't escaped to the heap")
 		}
 	})
 }
@@ -59,9 +58,10 @@ func TestScopeWithEscapedVariable(t *testing.T) {
 // the = and the initial value are optional and can only be specified if the
 // type is an integer type, float32, float64 or bool.
 //
-// If multiple variables with the same name are specified
-// LocalVariables+FunctionArguments should return them in the same order and
-// EvalExpression should return the last one.
+// If multiple variables with the same name are specified:
+// 1. LocalVariables+FunctionArguments should return them in the same order and
+//    every variable except the last one should be marked as shadowed
+// 2. EvalExpression should return the last one.
 func TestScope(t *testing.T) {
 	if ver, _ := goversion.Parse(runtime.Version()); ver.Major >= 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 9, -1, 0, 0, ""}) {
 		return
@@ -74,61 +74,37 @@ func TestScope(t *testing.T) {
 
 	withTestProcess("scopetest", t, func(p proc.Process, fixture protest.Fixture) {
 		for i := range scopeChecks {
-			setFileBreakpoint(p, t, fixture, scopeChecks[i].line)
+			setFileBreakpoint(p, t, fixture.Source, scopeChecks[i].line)
 		}
 
 		t.Logf("%d breakpoints set", len(scopeChecks))
 
 		for {
 			if err := proc.Continue(p); err != nil {
-				if _, exited := err.(proc.ProcessExitedError); exited {
+				if _, exited := err.(proc.ErrProcessExited); exited {
 					break
 				}
 				assertNoError(err, t, "Continue()")
 			}
-			bp, _, _ := p.CurrentThread().Breakpoint()
+			bp := p.CurrentThread().Breakpoint()
 
 			scopeCheck := findScopeCheck(scopeChecks, bp.Line)
 			if scopeCheck == nil {
 				t.Errorf("unknown stop position %s:%d %#x", bp.File, bp.Line, bp.Addr)
 			}
 
-			scope, err := proc.GoroutineScope(p.CurrentThread())
-			assertNoError(err, t, "GoroutineScope()")
+			scope, _ := scopeCheck.checkLocalsAndArgs(p, t)
 
-			args, err := scope.FunctionArguments(normalLoadConfig)
-			assertNoError(err, t, "FunctionArguments()")
-			locals, err := scope.LocalVariables(normalLoadConfig)
-			assertNoError(err, t, "LocalVariables()")
-
-			for _, arg := range args {
-				scopeCheck.checkVar(arg, t)
-			}
-
-			for _, local := range locals {
-				scopeCheck.checkVar(local, t)
-			}
-
-			for i := range scopeCheck.varChecks {
-				if !scopeCheck.varChecks[i].ok {
-					t.Errorf("%d: variable %s not found", scopeCheck.line, scopeCheck.varChecks[i].name)
-				}
-			}
-
-			var prev *varCheck
 			for i := range scopeCheck.varChecks {
 				vc := &scopeCheck.varChecks[i]
-				if prev != nil && prev.name != vc.name {
-					prev.checkInScope(scopeCheck.line, scope, t)
+				if vc.shdw {
+					continue
 				}
-				prev = vc
-			}
-			if prev != nil {
-				prev.checkInScope(scopeCheck.line, scope, t)
+				vc.checkInScope(scopeCheck.line, scope, t)
 			}
 
 			scopeCheck.ok = true
-			_, err = p.ClearBreakpoint(bp.Addr)
+			_, err := p.ClearBreakpoint(bp.Addr)
 			assertNoError(err, t, "ClearBreakpoint")
 		}
 	})
@@ -151,6 +127,7 @@ type varCheck struct {
 	name     string
 	typ      string
 	kind     reflect.Kind
+	shdw     bool // this variable should be shadowed
 	hasVal   bool
 	intVal   int64
 	uintVal  uint64
@@ -250,16 +227,49 @@ func (check *scopeCheck) Parse(descr string, t *testing.T) {
 			if err != nil {
 				t.Fatalf("could not parse scope comment %q: %v", descr, err)
 			}
-
 		}
 	}
+
+	for i := 1; i < len(check.varChecks); i++ {
+		if check.varChecks[i-1].name == check.varChecks[i].name {
+			check.varChecks[i-1].shdw = true
+		}
+	}
+}
+
+func (scopeCheck *scopeCheck) checkLocalsAndArgs(p proc.Process, t *testing.T) (*proc.EvalScope, bool) {
+	scope, err := proc.GoroutineScope(p.CurrentThread())
+	assertNoError(err, t, "GoroutineScope()")
+
+	ok := true
+
+	args, err := scope.FunctionArguments(normalLoadConfig)
+	assertNoError(err, t, "FunctionArguments()")
+	locals, err := scope.LocalVariables(normalLoadConfig)
+	assertNoError(err, t, "LocalVariables()")
+
+	for _, arg := range args {
+		scopeCheck.checkVar(arg, t)
+	}
+
+	for _, local := range locals {
+		scopeCheck.checkVar(local, t)
+	}
+
+	for i := range scopeCheck.varChecks {
+		if !scopeCheck.varChecks[i].ok {
+			t.Errorf("%d: variable %s not found", scopeCheck.line, scopeCheck.varChecks[i].name)
+			ok = false
+		}
+	}
+
+	return scope, ok
 }
 
 func (check *scopeCheck) checkVar(v *proc.Variable, t *testing.T) {
 	var varCheck *varCheck
 	for i := range check.varChecks {
-		varCheck = &check.varChecks[i]
-		if !varCheck.ok && (varCheck.name == v.Name) {
+		if !check.varChecks[i].ok && (check.varChecks[i].name == v.Name) {
 			varCheck = &check.varChecks[i]
 			break
 		}
@@ -267,6 +277,7 @@ func (check *scopeCheck) checkVar(v *proc.Variable, t *testing.T) {
 
 	if varCheck == nil {
 		t.Errorf("%d: unexpected variable %s", check.line, v.Name)
+		return
 	}
 
 	varCheck.check(check.line, v, t, "FunctionArguments+LocalVariables")
@@ -285,6 +296,10 @@ func (varCheck *varCheck) check(line int, v *proc.Variable, t *testing.T, ctxt s
 	typ = strings.Replace(typ, " ", "", -1)
 	if typ != varCheck.typ {
 		t.Errorf("%d: wrong type for %s (%s), got %s, expected %s", line, v.Name, ctxt, typ, varCheck.typ)
+	}
+
+	if varCheck.shdw && v.Flags&proc.VariableShadowed == 0 {
+		t.Errorf("%d: expected shadowed %s variable", line, v.Name)
 	}
 
 	if !varCheck.hasVal {

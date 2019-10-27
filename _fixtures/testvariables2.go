@@ -62,6 +62,10 @@ func (a *astruct) Error() string {
 	return "not an error"
 }
 
+func (a astruct) NonPointerRecieverMethod() {
+	return
+}
+
 func (b *bstruct) Error() string {
 	return "not an error"
 }
@@ -89,6 +93,19 @@ type truncatedMap struct {
 	v []map[string]astruct
 }
 
+type Cache struct {
+	blocks [2000]Block
+}
+
+type Block struct {
+	cache *Cache
+}
+
+type List struct {
+	N    int
+	Next *List
+}
+
 func main() {
 	i1 := 1
 	i2 := 2
@@ -108,7 +125,11 @@ func main() {
 	var fn2 functype = nil
 	var nilslice []int = nil
 	var nilptr *int = nil
-	ch1 := make(chan int, 2)
+	ch1 := make(chan int, 10)
+	ch1 <- 1
+	ch1 <- 4
+	ch1 <- 3
+	ch1 <- 2
 	var chnil chan int = nil
 	m1 := map[string]astruct{
 		"Malone":          astruct{2, 3},
@@ -152,6 +173,31 @@ func main() {
 		"tumblers":        astruct{},
 		"horticulturists": astruct{},
 		"thallium":        astruct{},
+		"capital":         astruct{},
+		"paramese":        astruct{},
+		"vaccinationist":  astruct{},
+		"shadrach":        astruct{},
+		"unsincereness":   astruct{},
+		"undazzled":       astruct{},
+		"heautomorphism":  astruct{},
+		"undermeasure":    astruct{},
+		"intentionally":   astruct{},
+		"glycine":         astruct{},
+		"basiliscine":     astruct{},
+		"preinvolvement":  astruct{},
+		"adversaria":      astruct{},
+		"capocchia":       astruct{},
+		"annunciable":     astruct{},
+		"unguidableness":  astruct{},
+		"prankster":       astruct{},
+		"jagless":         astruct{},
+		"hormonal":        astruct{},
+		"crenature":       astruct{},
+		"unfluttering":    astruct{},
+		"councilmanic":    astruct{},
+		"Micraster":       astruct{},
+		"raphidiferous":   astruct{},
+		"groomer":         astruct{},
 	}
 	var mnil map[string]astruct = nil
 	m2 := map[int]*astruct{1: &astruct{10, 11}}
@@ -183,6 +229,7 @@ func main() {
 	mapinf["inf"] = mapinf
 	var bencharr [64]benchstruct
 	var benchparr [64]*benchstruct
+	var issue1578 Block
 	mainMenu := Menu{
 		{Name: "home", Route: "/", Active: 1},
 		{Name: "About", Route: "/about", Active: 1},
@@ -235,6 +282,31 @@ func main() {
 	emptyslice := []string{}
 	emptymap := make(map[string]string)
 
+	byteslice := []byte{116, 195, 168, 115, 116}
+	runeslice := []rune{116, 232, 115, 116}
+
+	bytearray := [5]byte{116, 195, 168, 115, 116}
+	runearray := [4]rune{116, 232, 115, 116}
+
+	longstr := "very long string 0123456789a0123456789b0123456789c0123456789d0123456789e0123456789f0123456789g012345678h90123456789i0123456789j0123456789"
+
+	var nilstruct *astruct = nil
+
+	var as2 astruct
+
+	s4 := []int{1, 2, 3, 4, 5, 6, 7, 8, 9, 0}
+
+	var iface2map interface{} = map[string]interface{}{
+		"a": map[string]interface{}{
+			"1": map[string]interface{}{
+				"x": 1,
+				"y": 2,
+			},
+		},
+	}
+
+	ll := &List{0, &List{1, &List{2, &List{3, &List{4, nil}}}}}
+
 	var amb1 = 1
 	runtime.Breakpoint()
 	for amb1 := 0; amb1 < 10; amb1++ {
@@ -242,5 +314,5 @@ func main() {
 	}
 
 	runtime.Breakpoint()
-	fmt.Println(i1, i2, i3, p1, amb1, s1, s3, a1, p2, p3, s2, as1, str1, f1, fn1, fn2, nilslice, nilptr, ch1, chnil, m1, mnil, m2, m3, up1, i4, i5, i6, err1, err2, errnil, iface1, iface2, ifacenil, arr1, parr, cpx1, const1, iface3, iface4, recursive1, recursive1.x, iface5, iface2fn1, iface2fn2, bencharr, benchparr, mapinf, mainMenu, b, b2, sd, anonstruct1, anonstruct2, anoniface1, anonfunc, mapanonstruct1, ifacearr, efacearr, ni8, ni16, ni32, pinf, ninf, nan, zsvmap, zsslice, zsvar, tm, errtypednil, emptyslice, emptymap)
+	fmt.Println(i1, i2, i3, p1, amb1, s1, s3, a1, p2, p3, s2, as1, str1, f1, fn1, fn2, nilslice, nilptr, ch1, chnil, m1, mnil, m2, m3, up1, i4, i5, i6, err1, err2, errnil, iface1, iface2, ifacenil, arr1, parr, cpx1, const1, iface3, iface4, recursive1, recursive1.x, iface5, iface2fn1, iface2fn2, bencharr, benchparr, mapinf, mainMenu, b, b2, sd, anonstruct1, anonstruct2, anoniface1, anonfunc, mapanonstruct1, ifacearr, efacearr, ni8, ni16, ni32, pinf, ninf, nan, zsvmap, zsslice, zsvar, tm, errtypednil, emptyslice, emptymap, byteslice, runeslice, bytearray, runearray, longstr, nilstruct, as2, as2.NonPointerRecieverMethod, s4, iface2map, issue1578, ll)
 }

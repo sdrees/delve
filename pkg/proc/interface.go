@@ -40,10 +40,13 @@ type RecordingManipulation interface {
 	ClearCheckpoint(id int) error
 }
 
+// Direction is the direction of execution for the target process.
 type Direction int8
 
 const (
-	Forward  Direction = 0
+	// Forward direction executes the target normally.
+	Forward Direction = 0
+	// Backward direction executes the target in reverse.
 	Backward Direction = 1
 )
 
@@ -60,8 +63,14 @@ type Info interface {
 	// ResumeNotify specifies a channel that will be closed the next time
 	// ContinueOnce finishes resuming the target.
 	ResumeNotify(chan<- struct{})
-	Exited() bool
+	// Valid returns true if this Process can be used. When it returns false it
+	// also returns an error describing why the Process is invalid (either
+	// ErrProcessExited or ProcessDetachedError).
+	Valid() (bool, error)
 	BinInfo() *BinaryInfo
+	EntryPoint() (uint64, error)
+	// Common returns a struct with fields common to all backends
+	Common() *CommonProcess
 
 	ThreadInfo
 	GoroutineInfo
@@ -78,6 +87,7 @@ type ThreadInfo interface {
 // GoroutineInfo is an interface for getting information on running goroutines.
 type GoroutineInfo interface {
 	SelectedGoroutine() *G
+	SetSelectedGoroutine(*G)
 }
 
 // ProcessManipulation is an interface for changing the execution state of a process.
@@ -87,18 +97,44 @@ type ProcessManipulation interface {
 	SwitchThread(int) error
 	SwitchGoroutine(int) error
 	RequestManualStop() error
-	// ManualStopRequested returns true the first time it's called after a call
-	// to RequestManualStop.
-	ManualStopRequested() bool
-	Halt() error
-	Kill() error
+	// CheckAndClearManualStopRequest returns true the first time it's called
+	// after a call to RequestManualStop.
+	CheckAndClearManualStopRequest() bool
 	Detach(bool) error
 }
 
 // BreakpointManipulation is an interface for managing breakpoints.
 type BreakpointManipulation interface {
-	Breakpoints() map[uint64]*Breakpoint
+	Breakpoints() *BreakpointMap
 	SetBreakpoint(addr uint64, kind BreakpointKind, cond ast.Expr) (*Breakpoint, error)
 	ClearBreakpoint(addr uint64) (*Breakpoint, error)
 	ClearInternalBreakpoints() error
+}
+
+// CommonProcess contains fields used by this package, common to all
+// implementations of the Process interface.
+type CommonProcess struct {
+	allGCache     []*G
+	fncallEnabled bool
+
+	fncallForG map[int]*callInjection
+}
+
+type callInjection struct {
+	// if continueCompleted is not nil it means we are in the process of
+	// executing an injected function call, see comments throughout
+	// pkg/proc/fncall.go for a description of how this works.
+	continueCompleted chan<- *G
+	continueRequest   <-chan continueRequest
+}
+
+// NewCommonProcess returns a struct with fields common across
+// all process implementations.
+func NewCommonProcess(fncallEnabled bool) CommonProcess {
+	return CommonProcess{fncallEnabled: fncallEnabled, fncallForG: make(map[int]*callInjection)}
+}
+
+// ClearAllGCache clears the cached contents of the cache for runtime.allgs.
+func (p *CommonProcess) ClearAllGCache() {
+	p.allGCache = nil
 }

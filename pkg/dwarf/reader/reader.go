@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/derekparker/delve/pkg/dwarf/op"
+	"github.com/go-delve/delve/pkg/dwarf/op"
 )
 
 type Reader struct {
@@ -34,7 +34,7 @@ func (reader *Reader) SeekToEntry(entry *dwarf.Entry) error {
 
 // SeekToFunctionEntry moves the reader to the function that includes the
 // specified program counter.
-func (reader *Reader) SeekToFunction(pc uint64) (*dwarf.Entry, error) {
+func (reader *Reader) SeekToFunction(pc RelAddr) (*dwarf.Entry, error) {
 	reader.Seek(0)
 	for entry, err := reader.Next(); entry != nil; entry, err = reader.Next() {
 		if err != nil {
@@ -55,7 +55,7 @@ func (reader *Reader) SeekToFunction(pc uint64) (*dwarf.Entry, error) {
 			continue
 		}
 
-		if lowpc <= pc && highpc > pc {
+		if lowpc <= uint64(pc) && highpc > uint64(pc) {
 			return entry, nil
 		}
 	}
@@ -64,7 +64,7 @@ func (reader *Reader) SeekToFunction(pc uint64) (*dwarf.Entry, error) {
 }
 
 // Returns the address for the named entry.
-func (reader *Reader) AddrFor(name string) (uint64, error) {
+func (reader *Reader) AddrFor(name string, staticBase uint64) (uint64, error) {
 	entry, err := reader.FindEntryNamed(name, false)
 	if err != nil {
 		return 0, err
@@ -73,7 +73,7 @@ func (reader *Reader) AddrFor(name string) (uint64, error) {
 	if !ok {
 		return 0, fmt.Errorf("type assertion failed")
 	}
-	addr, err := op.ExecuteStackProgram(0, instructions)
+	addr, _, err := op.ExecuteStackProgram(op.DwarfRegisters{StaticBase: staticBase}, instructions)
 	if err != nil {
 		return 0, err
 	}
@@ -99,7 +99,7 @@ func (reader *Reader) AddrForMember(member string, initialInstructions []byte) (
 		if !ok {
 			continue
 		}
-		addr, err := op.ExecuteStackProgram(0, append(initialInstructions, instructions...))
+		addr, _, err := op.ExecuteStackProgram(op.DwarfRegisters{}, append(initialInstructions, instructions...))
 		return uint64(addr), err
 	}
 }
@@ -257,7 +257,7 @@ func (reader *Reader) InstructionsForEntry(entry *dwarf.Entry) ([]byte, error) {
 	return append([]byte{}, instructions...), nil
 }
 
-// NextMememberVariable moves the reader to the next debug entry that describes a member variable and returns the entry.
+// NextMemberVariable moves the reader to the next debug entry that describes a member variable and returns the entry.
 func (reader *Reader) NextMemberVariable() (*dwarf.Entry, error) {
 	for entry, err := reader.Next(); entry != nil; entry, err = reader.Next() {
 		if err != nil {
@@ -318,4 +318,129 @@ func (reader *Reader) NextCompileUnit() (*dwarf.Entry, error) {
 	}
 
 	return nil, nil
+}
+
+// Entry represents a debug_info entry.
+// When calling Val, if the entry does not have the specified attribute, the
+// entry specified by DW_AT_abstract_origin will be searched recursively.
+type Entry interface {
+	Val(dwarf.Attr) interface{}
+}
+
+type compositeEntry []*dwarf.Entry
+
+func (ce compositeEntry) Val(attr dwarf.Attr) interface{} {
+	for _, e := range ce {
+		if r := e.Val(attr); r != nil {
+			return r
+		}
+	}
+	return nil
+}
+
+// LoadAbstractOrigin loads the entry corresponding to the
+// DW_AT_abstract_origin of entry and returns a combination of entry and its
+// abstract origin.
+func LoadAbstractOrigin(entry *dwarf.Entry, aordr *dwarf.Reader) (Entry, dwarf.Offset) {
+	ao, ok := entry.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
+	if !ok {
+		return entry, entry.Offset
+	}
+
+	r := []*dwarf.Entry{entry}
+
+	for {
+		aordr.Seek(ao)
+		e, _ := aordr.Next()
+		if e == nil {
+			break
+		}
+		r = append(r, e)
+
+		ao, ok = e.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
+		if !ok {
+			break
+		}
+	}
+
+	return compositeEntry(r), entry.Offset
+}
+
+// InlineStackReader provides a way to read the stack of inlined calls at a
+// specified PC address.
+type InlineStackReader struct {
+	dwarf  *dwarf.Data
+	reader *dwarf.Reader
+	entry  *dwarf.Entry
+	depth  int
+	pc     uint64
+	err    error
+}
+
+// InlineStack returns an InlineStackReader for the specified function and
+// PC address.
+// If pc is 0 then all inlined calls will be returned.
+func InlineStack(dwarf *dwarf.Data, fnoff dwarf.Offset, pc RelAddr) *InlineStackReader {
+	reader := dwarf.Reader()
+	reader.Seek(fnoff)
+	return &InlineStackReader{dwarf: dwarf, reader: reader, entry: nil, depth: 0, pc: uint64(pc)}
+}
+
+// Next reads next inlined call in the stack, returns false if there aren't any.
+func (irdr *InlineStackReader) Next() bool {
+	if irdr.err != nil {
+		return false
+	}
+
+	for {
+		irdr.entry, irdr.err = irdr.reader.Next()
+		if irdr.entry == nil || irdr.err != nil {
+			return false
+		}
+
+		switch irdr.entry.Tag {
+		case 0:
+			irdr.depth--
+			if irdr.depth == 0 {
+				return false
+			}
+
+		case dwarf.TagLexDwarfBlock, dwarf.TagSubprogram, dwarf.TagInlinedSubroutine:
+			var recur bool
+			if irdr.pc != 0 {
+				recur, irdr.err = entryRangesContains(irdr.dwarf, irdr.entry, irdr.pc)
+			} else {
+				recur = true
+			}
+			if recur {
+				irdr.depth++
+				if irdr.entry.Tag == dwarf.TagInlinedSubroutine {
+					return true
+				}
+			} else {
+				if irdr.depth == 0 {
+					return false
+				}
+				irdr.reader.SkipChildren()
+			}
+
+		default:
+			irdr.reader.SkipChildren()
+		}
+	}
+}
+
+// Entry returns the DIE for the current inlined call.
+func (irdr *InlineStackReader) Entry() *dwarf.Entry {
+	return irdr.entry
+}
+
+// Err returns an error, if any was encountered.
+func (irdr *InlineStackReader) Err() error {
+	return irdr.err
+}
+
+// SkipChildren skips all children of the current inlined call.
+func (irdr *InlineStackReader) SkipChildren() {
+	irdr.reader.SkipChildren()
 }

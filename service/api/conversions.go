@@ -2,15 +2,15 @@ package api
 
 import (
 	"bytes"
-	"debug/gosym"
+	"fmt"
 	"go/constant"
 	"go/printer"
 	"go/token"
 	"reflect"
 	"strconv"
 
-	"github.com/derekparker/delve/pkg/dwarf/godwarf"
-	"github.com/derekparker/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/dwarf/godwarf"
+	"github.com/go-delve/delve/pkg/proc"
 )
 
 // ConvertBreakpoint converts from a proc.Breakpoint to
@@ -24,6 +24,7 @@ func ConvertBreakpoint(bp *proc.Breakpoint) *Breakpoint {
 		Line:          bp.Line,
 		Addr:          bp.Addr,
 		Tracepoint:    bp.Tracepoint,
+		TraceReturn:   bp.TraceReturn,
 		Stacktrace:    bp.Stacktrace,
 		Goroutine:     bp.Goroutine,
 		Variables:     bp.Variables,
@@ -65,8 +66,8 @@ func ConvertThread(th proc.Thread) *Thread {
 
 	var bp *Breakpoint
 
-	if b, active, _ := th.Breakpoint(); active {
-		bp = ConvertBreakpoint(b)
+	if b := th.Breakpoint(); b.Active {
+		bp = ConvertBreakpoint(b.Breakpoint)
 	}
 
 	if g, _ := proc.GetG(th); g != nil {
@@ -122,6 +123,9 @@ func ConvertVar(v *proc.Variable) *Variable {
 		Cap:      v.Cap,
 		Flags:    VariableFlags(v.Flags),
 		Base:     v.Base,
+
+		LocationExpr: v.LocationExpr,
+		DeclLine:     v.DeclLine,
 	}
 
 	r.Type = prettyTypeName(v.DwarfType)
@@ -140,7 +144,11 @@ func ConvertVar(v *proc.Variable) *Variable {
 		case reflect.String, reflect.Func:
 			r.Value = constant.StringVal(v.Value)
 		default:
-			r.Value = v.Value.String()
+			if cd := v.ConstDescr(); cd != "" {
+				r.Value = fmt.Sprintf("%s (%s)", cd, v.Value.String())
+			} else {
+				r.Value = v.Value.String()
+			}
 		}
 	}
 
@@ -149,30 +157,43 @@ func ConvertVar(v *proc.Variable) *Variable {
 		r.Children = make([]Variable, 2)
 		r.Len = 2
 
-		real, _ := constant.Float64Val(constant.Real(v.Value))
-		imag, _ := constant.Float64Val(constant.Imag(v.Value))
-
 		r.Children[0].Name = "real"
 		r.Children[0].Kind = reflect.Float32
-		r.Children[0].Value = strconv.FormatFloat(real, 'f', -1, 32)
 
 		r.Children[1].Name = "imaginary"
 		r.Children[1].Kind = reflect.Float32
-		r.Children[1].Value = strconv.FormatFloat(imag, 'f', -1, 32)
+
+		if v.Value != nil {
+			real, _ := constant.Float64Val(constant.Real(v.Value))
+			r.Children[0].Value = strconv.FormatFloat(real, 'f', -1, 32)
+
+			imag, _ := constant.Float64Val(constant.Imag(v.Value))
+			r.Children[1].Value = strconv.FormatFloat(imag, 'f', -1, 32)
+		} else {
+			r.Children[0].Value = "nil"
+			r.Children[1].Value = "nil"
+		}
+
 	case reflect.Complex128:
 		r.Children = make([]Variable, 2)
 		r.Len = 2
 
-		real, _ := constant.Float64Val(constant.Real(v.Value))
-		imag, _ := constant.Float64Val(constant.Imag(v.Value))
-
 		r.Children[0].Name = "real"
 		r.Children[0].Kind = reflect.Float64
-		r.Children[0].Value = strconv.FormatFloat(real, 'f', -1, 64)
 
 		r.Children[1].Name = "imaginary"
 		r.Children[1].Kind = reflect.Float64
-		r.Children[1].Value = strconv.FormatFloat(imag, 'f', -1, 64)
+
+		if v.Value != nil {
+			real, _ := constant.Float64Val(constant.Real(v.Value))
+			r.Children[0].Value = strconv.FormatFloat(real, 'f', -1, 64)
+
+			imag, _ := constant.Float64Val(constant.Imag(v.Value))
+			r.Children[1].Value = strconv.FormatFloat(imag, 'f', -1, 64)
+		} else {
+			r.Children[0].Value = "nil"
+			r.Children[1].Value = "nil"
+		}
 
 	default:
 		r.Children = make([]Variable, len(v.Children))
@@ -187,16 +208,21 @@ func ConvertVar(v *proc.Variable) *Variable {
 
 // ConvertFunction converts from gosym.Func to
 // api.Function.
-func ConvertFunction(fn *gosym.Func) *Function {
+func ConvertFunction(fn *proc.Function) *Function {
 	if fn == nil {
 		return nil
 	}
 
+	// fn here used to be a *gosym.Func, the fields Type and GoType below
+	// corresponded to the homonymous field of gosym.Func. Since the contents of
+	// those fields is not documented their value was replaced with 0 when
+	// gosym.Func was replaced by debug_info entries.
 	return &Function{
-		Name:   fn.Name,
-		Type:   fn.Type,
-		Value:  fn.Value,
-		GoType: fn.GoType,
+		Name_:     fn.Name,
+		Type:      0,
+		Value:     fn.Entry,
+		GoType:    0,
+		Optimized: fn.Optimized(),
 	}
 }
 
@@ -207,13 +233,18 @@ func ConvertGoroutine(g *proc.G) *Goroutine {
 	if th != nil {
 		tid = th.ThreadID()
 	}
-	return &Goroutine{
+	r := &Goroutine{
 		ID:             g.ID,
 		CurrentLoc:     ConvertLocation(g.CurrentLoc),
 		UserCurrentLoc: ConvertLocation(g.UserCurrent()),
 		GoStatementLoc: ConvertLocation(g.Go()),
+		StartLoc:       ConvertLocation(g.StartLoc()),
 		ThreadID:       tid,
 	}
+	if g.Unreadable != nil {
+		r.Unreadable = g.Unreadable.Error()
+	}
+	return r
 }
 
 // ConvertLocation converts from proc.Location to api.Location.
@@ -226,6 +257,7 @@ func ConvertLocation(loc proc.Location) Location {
 	}
 }
 
+// ConvertAsmInstruction converts from proc.AsmInstruction to api.AsmInstruction.
 func ConvertAsmInstruction(inst proc.AsmInstruction, text string) AsmInstruction {
 	var destloc *Location
 	if inst.DestLoc != nil {
@@ -242,6 +274,7 @@ func ConvertAsmInstruction(inst proc.AsmInstruction, text string) AsmInstruction
 	}
 }
 
+// LoadConfigToProc converts an api.LoadConfig to proc.LoadConfig.
 func LoadConfigToProc(cfg *LoadConfig) *proc.LoadConfig {
 	if cfg == nil {
 		return nil
@@ -252,9 +285,11 @@ func LoadConfigToProc(cfg *LoadConfig) *proc.LoadConfig {
 		cfg.MaxStringLen,
 		cfg.MaxArrayValues,
 		cfg.MaxStructFields,
+		0, // MaxMapBuckets is set internally by pkg/proc, read its documentation for an explanation.
 	}
 }
 
+// LoadConfigFromProc converts a proc.LoadConfig to api.LoadConfig.
 func LoadConfigFromProc(cfg *proc.LoadConfig) *LoadConfig {
 	if cfg == nil {
 		return nil
@@ -268,6 +303,7 @@ func LoadConfigFromProc(cfg *proc.LoadConfig) *LoadConfig {
 	}
 }
 
+// ConvertRegisters converts proc.Register to api.Register for a slice.
 func ConvertRegisters(in []proc.Register) (out []Register) {
 	out = make([]Register, len(in))
 	for i := range in {
@@ -276,6 +312,11 @@ func ConvertRegisters(in []proc.Register) (out []Register) {
 	return
 }
 
+// ConvertCheckpoint converts proc.Chekcpoint to api.Checkpoint.
 func ConvertCheckpoint(in proc.Checkpoint) (out Checkpoint) {
 	return Checkpoint(in)
+}
+
+func ConvertImage(image *proc.Image) Image {
+	return Image{Path: image.Path, Address: image.StaticBase}
 }

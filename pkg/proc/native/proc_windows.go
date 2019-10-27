@@ -2,25 +2,24 @@ package native
 
 import (
 	"debug/pe"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sync"
 	"syscall"
 	"unsafe"
 
 	sys "golang.org/x/sys/windows"
 
-	"github.com/derekparker/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc"
 )
 
 // OSProcessDetails holds Windows specific information.
 type OSProcessDetails struct {
 	hProcess    syscall.Handle
 	breakThread int
+	entryPoint  uint64
 }
 
 func openExecutablePathPE(path string) (*pe.File, io.Closer, error) {
@@ -37,7 +36,7 @@ func openExecutablePathPE(path string) (*pe.File, io.Closer, error) {
 }
 
 // Launch creates and begins debugging a new process.
-func Launch(cmd []string, wd string) (*Process, error) {
+func Launch(cmd []string, wd string, foreground bool, _ []string) (*Process, error) {
 	argv0Go, err := filepath.Abs(cmd[0])
 	if err != nil {
 		return nil, err
@@ -52,12 +51,13 @@ func Launch(cmd []string, wd string) (*Process, error) {
 
 	_, closer, err := openExecutablePathPE(argv0Go)
 	if err != nil {
-		return nil, proc.NotExecutableErr
+		return nil, proc.ErrNotExecutable
 	}
 	closer.Close()
 
 	var p *os.Process
 	dbp := New(0)
+	dbp.common = proc.NewCommonProcess(true)
 	dbp.execPtraceFunc(func() {
 		attr := &os.ProcAttr{
 			Dir:   wd,
@@ -76,11 +76,14 @@ func Launch(cmd []string, wd string) (*Process, error) {
 	dbp.pid = p.Pid
 	dbp.childProcess = true
 
-	return newDebugProcess(dbp, argv0Go)
+	if err = dbp.initialize(argv0Go, []string{}); err != nil {
+		dbp.Detach(true)
+		return nil, err
+	}
+	return dbp, nil
 }
 
-// newDebugProcess prepares process pid for debugging.
-func newDebugProcess(dbp *Process, exepath string) (*Process, error) {
+func initialize(dbp *Process) error {
 	// It should not actually be possible for the
 	// call to waitForDebugEvent to fail, since Windows
 	// will always fire a CREATE_PROCESS_DEBUG_EVENT event
@@ -92,29 +95,25 @@ func newDebugProcess(dbp *Process, exepath string) (*Process, error) {
 		tid, exitCode, err = dbp.waitForDebugEvent(waitBlocking)
 	})
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if tid == 0 {
 		dbp.postExit()
-		return nil, proc.ProcessExitedError{Pid: dbp.pid, Status: exitCode}
+		return proc.ErrProcessExited{Pid: dbp.pid, Status: exitCode}
 	}
 	// Suspend all threads so that the call to _ContinueDebugEvent will
 	// not resume the target.
 	for _, thread := range dbp.threads {
 		_, err := _SuspendThread(thread.os.hThread)
 		if err != nil {
-			return nil, err
+			return err
 		}
 	}
 
 	dbp.execPtraceFunc(func() {
 		err = _ContinueDebugEvent(uint32(dbp.pid), uint32(dbp.os.breakThread), _DBG_CONTINUE)
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	return initializeDebugProcess(dbp, exepath)
+	return err
 }
 
 // findExePath searches for process pid, and returns its executable path.
@@ -152,7 +151,7 @@ func findExePath(pid int) (string, error) {
 }
 
 // Attach to an existing process with the given PID.
-func Attach(pid int) (*Process, error) {
+func Attach(pid int, _ []string) (*Process, error) {
 	// TODO: Probably should have SeDebugPrivilege before starting here.
 	err := _DebugActiveProcess(uint32(pid))
 	if err != nil {
@@ -162,21 +161,18 @@ func Attach(pid int) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	dbp, err := newDebugProcess(New(pid), exepath)
-	if err != nil {
-		dbp.Detach(false)
+	dbp := New(pid)
+	if err = dbp.initialize(exepath, []string{}); err != nil {
+		dbp.Detach(true)
 		return nil, err
 	}
 	return dbp, nil
 }
 
-// Kill kills the process.
-func (dbp *Process) Kill() error {
+// kill kills the process.
+func (dbp *Process) kill() error {
 	if dbp.exited {
 		return nil
-	}
-	if !dbp.threads[dbp.pid].Stopped() {
-		return errors.New("process must be stopped in order to kill it")
 	}
 
 	p, err := os.FindProcess(dbp.pid)
@@ -245,6 +241,8 @@ const (
 	waitDontHandleExceptions
 )
 
+const _MS_VC_EXCEPTION = 0x406D1388 // part of VisualC protocol to set thread names
+
 func (dbp *Process) waitForDebugEvent(flags waitForDebugEventFlags) (threadID, exitCode int, err error) {
 	var debugEvent _DEBUG_EVENT
 	shouldExit := false
@@ -272,6 +270,7 @@ func (dbp *Process) waitForDebugEvent(flags waitForDebugEventFlags) (threadID, e
 					return 0, 0, err
 				}
 			}
+			dbp.os.entryPoint = uint64(debugInfo.BaseOfImage)
 			dbp.os.hProcess = debugInfo.Process
 			_, err = dbp.addThread(debugInfo.Thread, int(debugEvent.ThreadId), false, flags&waitSuspendNewThreads != 0)
 			if err != nil {
@@ -345,6 +344,10 @@ func (dbp *Process) waitForDebugEvent(flags waitForDebugEventFlags) (threadID, e
 			case _EXCEPTION_SINGLE_STEP:
 				dbp.os.breakThread = tid
 				return tid, 0, nil
+			case _MS_VC_EXCEPTION:
+				// This exception is sent to set the thread name in VisualC, we should
+				// mask it or it might crash the program.
+				continueStatus = _DBG_CONTINUE
 			default:
 				continueStatus = _DBG_EXCEPTION_NOT_HANDLED
 			}
@@ -379,21 +382,46 @@ func (dbp *Process) trapWait(pid int) (*Thread, error) {
 	}
 	if tid == 0 {
 		dbp.postExit()
-		return nil, proc.ProcessExitedError{Pid: dbp.pid, Status: exitCode}
+		return nil, proc.ErrProcessExited{Pid: dbp.pid, Status: exitCode}
 	}
 	th := dbp.threads[tid]
 	return th, nil
-}
-
-func (dbp *Process) loadProcessInformation(wg *sync.WaitGroup) {
-	wg.Done()
 }
 
 func (dbp *Process) wait(pid, options int) (int, *sys.WaitStatus, error) {
 	return 0, nil, fmt.Errorf("not implemented: wait")
 }
 
-func (dbp *Process) setCurrentBreakpoints(trapthread *Thread) error {
+func (dbp *Process) exitGuard(err error) error {
+	return err
+}
+
+func (dbp *Process) resume() error {
+	for _, thread := range dbp.threads {
+		if thread.CurrentBreakpoint.Breakpoint != nil {
+			if err := thread.StepInstruction(); err != nil {
+				return err
+			}
+			thread.CurrentBreakpoint.Clear()
+		}
+	}
+
+	for _, thread := range dbp.threads {
+		_, err := _ResumeThread(thread.os.hThread)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// stop stops all running threads threads and sets breakpoints
+func (dbp *Process) stop(trapthread *Thread) (err error) {
+	if dbp.exited {
+		return &proc.ErrProcessExited{Pid: dbp.Pid()}
+	}
+
 	// While the debug event that stopped the target was being propagated
 	// other target threads could generate other debug events.
 	// After this function we need to know about all the threads
@@ -404,13 +432,12 @@ func (dbp *Process) setCurrentBreakpoints(trapthread *Thread) error {
 	// call to _ContinueDebugEvent will resume execution of some of the
 	// target threads.
 
-	err := trapthread.SetCurrentBreakpoint()
+	err = trapthread.SetCurrentBreakpoint(true)
 	if err != nil {
 		return err
 	}
 
 	for _, thread := range dbp.threads {
-		thread.running = false
 		_, err := _SuspendThread(thread.os.hThread)
 		if err != nil {
 			return err
@@ -432,32 +459,7 @@ func (dbp *Process) setCurrentBreakpoints(trapthread *Thread) error {
 		if tid == 0 {
 			break
 		}
-		err = dbp.threads[tid].SetCurrentBreakpoint()
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (dbp *Process) exitGuard(err error) error {
-	return err
-}
-
-func (dbp *Process) resume() error {
-	for _, thread := range dbp.threads {
-		if thread.CurrentBreakpoint != nil {
-			if err := thread.StepInstruction(); err != nil {
-				return err
-			}
-			thread.CurrentBreakpoint = nil
-		}
-	}
-
-	for _, thread := range dbp.threads {
-		thread.running = true
-		_, err := _ResumeThread(thread.os.hThread)
+		err = dbp.threads[tid].SetCurrentBreakpoint(true)
 		if err != nil {
 			return err
 		}
@@ -476,6 +478,10 @@ func (dbp *Process) detach(kill bool) error {
 		}
 	}
 	return _DebugActiveProcessStop(uint32(dbp.pid))
+}
+
+func (dbp *Process) EntryPoint() (uint64, error) {
+	return dbp.os.entryPoint, nil
 }
 
 func killProcess(pid int) error {

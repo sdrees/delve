@@ -54,7 +54,7 @@
 // event is reported, if any other event happens "simultaneously" they are
 // suppressed by the stub and the debugger can query for them using
 // qThreadStopInfo. This is much easier for us to implement and the
-// implementation gracefully degrates to the case where qThreadStopInfo is
+// implementation gracefully degrades to the case where qThreadStopInfo is
 // unavailable but the inferior is run in single threaded mode.
 //
 // Therefore the following code will assume lldb-server-like behavior.
@@ -74,19 +74,19 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.org/x/arch/x86/x86asm"
 
-	"github.com/derekparker/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/logflags"
+	"github.com/go-delve/delve/pkg/proc"
+	"github.com/go-delve/delve/pkg/proc/linutil"
+	isatty "github.com/mattn/go-isatty"
 )
 
 const (
-	logGdbWire               = false
-	logGdbWireFullStopPacket = false
-	showLldbServerOutput     = false
-	logGdbWireMaxLen         = 120
+	gdbWireFullStopPacket = false
+	gdbWireMaxLen         = 120
 
 	maxTransmitAttempts    = 3    // number of retransmission attempts on failed checksum
 	initialInputBufferSize = 2048 // size of the input buffer for gdbConn
@@ -94,26 +94,26 @@ const (
 
 const heartbeatInterval = 10 * time.Second
 
+// ErrDirChange is returned when trying to change execution direction
+// while there are still internal breakpoints set.
 var ErrDirChange = errors.New("direction change with internal breakpoints")
 
 // Process implements proc.Process using a connection to a debugger stub
 // that understands Gdb Remote Serial Protocol.
 type Process struct {
-	bi   proc.BinaryInfo
+	bi   *proc.BinaryInfo
 	conn gdbConn
 
 	threads           map[int]*Thread
 	currentThread     *Thread
 	selectedGoroutine *proc.G
 
-	exited bool
-	ctrlC  bool // ctrl-c was sent to stop inferior
+	exited, detached bool
+	ctrlC            bool // ctrl-c was sent to stop inferior
 
 	manualStopRequested bool
 
-	breakpoints                 map[uint64]*proc.Breakpoint
-	breakpointIDCounter         int
-	internalBreakpointIDCounter int
+	breakpoints proc.BreakpointMap
 
 	gcmdok         bool   // true if the stub supports g and G commands
 	threadStopInfo bool   // true if the stub supports qThreadStopInfo
@@ -124,19 +124,27 @@ type Process struct {
 	process  *os.Process
 	waitChan chan *os.ProcessState
 
-	allGCache []*proc.G
+	onDetach func() // called after a successful detach
+
+	common proc.CommonProcess
 }
 
-// Thread is a thread.
+// Thread represents an operating system thread.
 type Thread struct {
-	ID                       int
-	strID                    string
-	regs                     gdbRegisters
-	CurrentBreakpoint        *proc.Breakpoint
-	BreakpointConditionMet   bool
-	BreakpointConditionError error
-	p                        *Process
-	setbp                    bool // thread was stopped because of a breakpoint
+	ID                int
+	strID             string
+	regs              gdbRegisters
+	CurrentBreakpoint proc.BreakpointState
+	p                 *Process
+	setbp             bool // thread was stopped because of a breakpoint
+	common            proc.CommonThread
+}
+
+// ErrBackendUnavailable is returned when the stub program can not be found.
+type ErrBackendUnavailable struct{}
+
+func (err *ErrBackendUnavailable) Error() string {
+	return "backend unavailable"
 }
 
 // gdbRegisters represents the current value of the registers of a thread.
@@ -162,18 +170,21 @@ type gdbRegister struct {
 // Detach.
 // Use Listen, Dial or Connect to complete connection.
 func New(process *os.Process) *Process {
+	logger := logflags.GdbWireLogger()
 	p := &Process{
 		conn: gdbConn{
 			maxTransmitAttempts: maxTransmitAttempts,
 			inbuf:               make([]byte, 0, initialInputBufferSize),
 			direction:           proc.Forward,
+			log:                 logger,
 		},
 		threads:        make(map[int]*Thread),
 		bi:             proc.NewBinaryInfo(runtime.GOOS, runtime.GOARCH),
-		breakpoints:    make(map[uint64]*proc.Breakpoint),
+		breakpoints:    proc.NewBreakpointMap(),
 		gcmdok:         true,
 		threadStopInfo: true,
 		process:        process,
+		common:         proc.NewCommonProcess(true),
 	}
 
 	if process != nil {
@@ -188,7 +199,7 @@ func New(process *os.Process) *Process {
 }
 
 // Listen waits for a connection from the stub.
-func (p *Process) Listen(listener net.Listener, path string, pid int) error {
+func (p *Process) Listen(listener net.Listener, path string, pid int, debugInfoDirs []string) error {
 	acceptChan := make(chan net.Conn)
 
 	go func() {
@@ -202,7 +213,7 @@ func (p *Process) Listen(listener net.Listener, path string, pid int) error {
 		if conn == nil {
 			return errors.New("could not connect")
 		}
-		return p.Connect(conn, path, pid)
+		return p.Connect(conn, path, pid, debugInfoDirs)
 	case status := <-p.waitChan:
 		listener.Close()
 		return fmt.Errorf("stub exited while waiting for connection: %v", status)
@@ -210,11 +221,11 @@ func (p *Process) Listen(listener net.Listener, path string, pid int) error {
 }
 
 // Dial attempts to connect to the stub.
-func (p *Process) Dial(addr string, path string, pid int) error {
+func (p *Process) Dial(addr string, path string, pid int, debugInfoDirs []string) error {
 	for {
 		conn, err := net.Dial("tcp", addr)
 		if err == nil {
-			return p.Connect(conn, path, pid)
+			return p.Connect(conn, path, pid, debugInfoDirs)
 		}
 		select {
 		case status := <-p.waitChan:
@@ -231,9 +242,8 @@ func (p *Process) Dial(addr string, path string, pid int) error {
 // program and the PID of the target process, both are optional, however
 // some stubs do not provide ways to determine path and pid automatically
 // and Connect will be unable to function without knowing them.
-func (p *Process) Connect(conn net.Conn, path string, pid int) error {
+func (p *Process) Connect(conn net.Conn, path string, pid int, debugInfoDirs []string) error {
 	p.conn.conn = conn
-
 	p.conn.pid = pid
 	err := p.conn.handshake()
 	if err != nil {
@@ -241,47 +251,19 @@ func (p *Process) Connect(conn net.Conn, path string, pid int) error {
 		return err
 	}
 
-	if path == "" {
-		// If we are attaching to a running process and the user didn't specify
-		// the executable file manually we must ask the stub for it.
-		// We support both qXfer:exec-file:read:: (the gdb way) and calling
-		// qProcessInfo (the lldb way).
-		// Unfortunately debugserver on macOS supports neither.
-		path, err = p.conn.readExecFile()
-		if err != nil {
-			if isProtocolErrorUnsupported(err) {
-				_, path, err = p.loadProcessInfo(pid)
-				if err != nil {
-					conn.Close()
-					return err
+	if verbuf, err := p.conn.exec([]byte("$qGDBServerVersion"), "init"); err == nil {
+		for _, v := range strings.Split(string(verbuf), ";") {
+			if strings.HasPrefix(v, "version:") {
+				if v[len("version:"):] == "902" {
+					// Workaround for https://bugs.llvm.org/show_bug.cgi?id=36968, 'g' command crashes a version of debugserver on some systems (?)
+					p.gcmdok = false
+					break
 				}
-			} else {
-				conn.Close()
-				return fmt.Errorf("could not determine executable path: %v", err)
 			}
 		}
 	}
 
-	if path == "" {
-		// try using jGetLoadedDynamicLibrariesInfos which is the only way to do
-		// this supported on debugserver (but only on macOS >= 12.10)
-		images, _ := p.conn.getLoadedDynamicLibraries()
-		for _, image := range images {
-			if image.MachHeader.FileType == macho.TypeExec {
-				path = image.Pathname
-				break
-			}
-		}
-	}
-
-	var wg sync.WaitGroup
-	err = p.bi.LoadBinaryInfo(path, &wg)
-	wg.Wait()
-	if err == nil {
-		err = p.bi.LoadError()
-	}
-	if err != nil {
-		conn.Close()
+	if err := p.initialize(path, debugInfoDirs); err != nil {
 		return err
 	}
 
@@ -298,36 +280,6 @@ func (p *Process) Connect(conn net.Conn, path string, pid int) error {
 			p.loadGInstrAddr = addr
 		}
 	}
-
-	err = p.updateThreadList(&threadUpdater{p: p})
-	if err != nil {
-		conn.Close()
-		p.bi.Close()
-		return err
-	}
-
-	if p.conn.pid <= 0 {
-		p.conn.pid, _, err = p.loadProcessInfo(0)
-		if err != nil && !isProtocolErrorUnsupported(err) {
-			conn.Close()
-			p.bi.Close()
-			return err
-		}
-	}
-
-	p.selectedGoroutine, _ = proc.GetG(p.CurrentThread())
-
-	panicpc, err := proc.FindFunctionLocation(p, "runtime.startpanic", true, 0)
-	if err == nil {
-		bp, err := p.SetBreakpoint(panicpc, proc.UserBreakpoint, nil)
-		if err == nil {
-			bp.Name = proc.UnrecoveredPanic
-			bp.Variables = []string{"runtime.curg._panic.arg"}
-			bp.ID = -1
-			p.breakpointIDCounter--
-		}
-	}
-
 	return nil
 }
 
@@ -337,7 +289,7 @@ func (p *Process) Connect(conn net.Conn, path string, pid int) error {
 // before reassigning one port they just assigned, unless there's heavy
 // churn in the ephemeral range this should work.
 func unusedPort() string {
-	listener, err := net.Listen("tcp", "localhost:0")
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return ":8081"
 	}
@@ -348,7 +300,8 @@ func unusedPort() string {
 
 const debugserverExecutable = "/Library/Developer/CommandLineTools/Library/PrivateFrameworks/LLDB.framework/Versions/A/Resources/debugserver"
 
-var ErrUnsupportedOS = errors.New("lldb backend not supported on windows")
+// ErrUnsupportedOS is returned when trying to use the lldb backend on Windows.
+var ErrUnsupportedOS = errors.New("lldb backend not supported on Windows")
 
 func getLdEnvVars() []string {
 	var result []string
@@ -367,14 +320,22 @@ func getLdEnvVars() []string {
 // LLDBLaunch starts an instance of lldb-server and connects to it, asking
 // it to launch the specified target program with the specified arguments
 // (cmd) on the specified directory wd.
-func LLDBLaunch(cmd []string, wd string) (*Process, error) {
+func LLDBLaunch(cmd []string, wd string, foreground bool, debugInfoDirs []string) (*Process, error) {
 	switch runtime.GOOS {
 	case "windows":
 		return nil, ErrUnsupportedOS
 	default:
 		// check that the argument to Launch is an executable file
 		if fi, staterr := os.Stat(cmd[0]); staterr == nil && (fi.Mode()&0111) == 0 {
-			return nil, proc.NotExecutableErr
+			return nil, proc.ErrNotExecutable
+		}
+	}
+
+	if foreground {
+		// Disable foregrounding if we can't open /dev/tty or debugserver will
+		// crash. See issue #1215.
+		if !isatty.IsTerminal(os.Stdin.Fd()) {
+			foreground = false
 		}
 	}
 
@@ -384,13 +345,16 @@ func LLDBLaunch(cmd []string, wd string) (*Process, error) {
 	var port string
 	var proc *exec.Cmd
 	if _, err := os.Stat(debugserverExecutable); err == nil {
-		listener, err = net.Listen("tcp", "localhost:0")
+		listener, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			return nil, err
 		}
 		ldEnvVars := getLdEnvVars()
 		args := make([]string, 0, len(cmd)+4+len(ldEnvVars))
 		args = append(args, ldEnvVars...)
+		if foreground {
+			args = append(args, "--stdio-path", "/dev/tty")
+		}
 		args = append(args, "-F", "-R", fmt.Sprintf("127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port), "--")
 		args = append(args, cmd...)
 
@@ -398,6 +362,9 @@ func LLDBLaunch(cmd []string, wd string) (*Process, error) {
 
 		proc = exec.Command(debugserverExecutable, args...)
 	} else {
+		if _, err := exec.LookPath("lldb-server"); err != nil {
+			return nil, &ErrBackendUnavailable{}
+		}
 		port = unusedPort()
 		args := make([]string, 0, len(cmd)+3)
 		args = append(args, "gdbserver")
@@ -407,15 +374,19 @@ func LLDBLaunch(cmd []string, wd string) (*Process, error) {
 		proc = exec.Command("lldb-server", args...)
 	}
 
-	if showLldbServerOutput || logGdbWire {
+	if logflags.LLDBServerOutput() || logflags.GdbWire() || foreground {
 		proc.Stdout = os.Stdout
 		proc.Stderr = os.Stderr
+	}
+	if foreground {
+		foregroundSignalsIgnore()
+		proc.Stdin = os.Stdin
 	}
 	if wd != "" {
 		proc.Dir = wd
 	}
 
-	proc.SysProcAttr = backgroundSysProcAttr()
+	proc.SysProcAttr = sysProcAttr(foreground)
 
 	err := proc.Start()
 	if err != nil {
@@ -426,9 +397,9 @@ func LLDBLaunch(cmd []string, wd string) (*Process, error) {
 	p.conn.isDebugserver = isDebugserver
 
 	if listener != nil {
-		err = p.Listen(listener, cmd[0], 0)
+		err = p.Listen(listener, cmd[0], 0, debugInfoDirs)
 	} else {
-		err = p.Dial(port, cmd[0], 0)
+		err = p.Dial(port, cmd[0], 0, debugInfoDirs)
 	}
 	if err != nil {
 		return nil, err
@@ -441,44 +412,46 @@ func LLDBLaunch(cmd []string, wd string) (*Process, error) {
 // Path is path to the target's executable, path only needs to be specified
 // for some stubs that do not provide an automated way of determining it
 // (for example debugserver).
-func LLDBAttach(pid int, path string) (*Process, error) {
+func LLDBAttach(pid int, path string, debugInfoDirs []string) (*Process, error) {
 	if runtime.GOOS == "windows" {
 		return nil, ErrUnsupportedOS
 	}
 
 	isDebugserver := false
-	var proc *exec.Cmd
+	var process *exec.Cmd
 	var listener net.Listener
 	var port string
 	if _, err := os.Stat(debugserverExecutable); err == nil {
 		isDebugserver = true
-		listener, err = net.Listen("tcp", "localhost:0")
+		listener, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			return nil, err
 		}
-		proc = exec.Command(debugserverExecutable, "-R", fmt.Sprintf("127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port), "--attach="+strconv.Itoa(pid))
+		process = exec.Command(debugserverExecutable, "-R", fmt.Sprintf("127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port), "--attach="+strconv.Itoa(pid))
 	} else {
+		if _, err := exec.LookPath("lldb-server"); err != nil {
+			return nil, &ErrBackendUnavailable{}
+		}
 		port = unusedPort()
-		proc = exec.Command("lldb-server", "gdbserver", "--attach", strconv.Itoa(pid), port)
+		process = exec.Command("lldb-server", "gdbserver", "--attach", strconv.Itoa(pid), port)
 	}
 
-	proc.Stdout = os.Stdout
-	proc.Stderr = os.Stderr
+	process.Stdout = os.Stdout
+	process.Stderr = os.Stderr
+	process.SysProcAttr = sysProcAttr(false)
 
-	proc.SysProcAttr = backgroundSysProcAttr()
-
-	err := proc.Start()
+	err := process.Start()
 	if err != nil {
 		return nil, err
 	}
 
-	p := New(proc.Process)
+	p := New(process.Process)
 	p.conn.isDebugserver = isDebugserver
 
 	if listener != nil {
-		err = p.Listen(listener, path, pid)
+		err = p.Listen(listener, path, pid, debugInfoDirs)
 	} else {
-		err = p.Dial(port, path, pid)
+		err = p.Dial(port, path, pid, debugInfoDirs)
 	}
 	if err != nil {
 		return nil, err
@@ -486,10 +459,80 @@ func LLDBAttach(pid int, path string) (*Process, error) {
 	return p, nil
 }
 
-// loadProcessInfo uses qProcessInfo to load the inferior's PID and
+// EntryPoint will return the process entry point address, useful for
+// debugging PIEs.
+func (p *Process) EntryPoint() (uint64, error) {
+	var entryPoint uint64
+	if auxv, err := p.conn.readAuxv(); err == nil {
+		// If we can't read the auxiliary vector it just means it's not supported
+		// by the OS or by the stub. If we are debugging a PIE and the entry point
+		// is needed proc.LoadBinaryInfo will complain about it.
+		entryPoint = linutil.EntryPointFromAuxvAMD64(auxv)
+	}
+	return entryPoint, nil
+}
+
+// initialize uses qProcessInfo to load the inferior's PID and
 // executable path. This command is not supported by all stubs and not all
 // stubs will report both the PID and executable path.
-func (p *Process) loadProcessInfo(pid int) (int, string, error) {
+func (p *Process) initialize(path string, debugInfoDirs []string) error {
+	var err error
+	if path == "" {
+		// If we are attaching to a running process and the user didn't specify
+		// the executable file manually we must ask the stub for it.
+		// We support both qXfer:exec-file:read:: (the gdb way) and calling
+		// qProcessInfo (the lldb way).
+		// Unfortunately debugserver on macOS supports neither.
+		path, err = p.conn.readExecFile()
+		if err != nil {
+			if isProtocolErrorUnsupported(err) {
+				_, path, err = queryProcessInfo(p, p.Pid())
+				if err != nil {
+					p.conn.conn.Close()
+					return err
+				}
+			} else {
+				p.conn.conn.Close()
+				return fmt.Errorf("could not determine executable path: %v", err)
+			}
+		}
+	}
+
+	if path == "" {
+		// try using jGetLoadedDynamicLibrariesInfos which is the only way to do
+		// this supported on debugserver (but only on macOS >= 12.10)
+		images, _ := p.conn.getLoadedDynamicLibraries()
+		for _, image := range images {
+			if image.MachHeader.FileType == macho.TypeExec {
+				path = image.Pathname
+				break
+			}
+		}
+	}
+
+	err = p.updateThreadList(&threadUpdater{p: p})
+	if err != nil {
+		p.conn.conn.Close()
+		p.bi.Close()
+		return err
+	}
+
+	if p.conn.pid <= 0 {
+		p.conn.pid, _, err = queryProcessInfo(p, 0)
+		if err != nil && !isProtocolErrorUnsupported(err) {
+			p.conn.conn.Close()
+			p.bi.Close()
+			return err
+		}
+	}
+	if err = proc.PostInitializationSetup(p, path, debugInfoDirs, p.writeBreakpoint); err != nil {
+		p.conn.conn.Close()
+		return err
+	}
+	return nil
+}
+
+func queryProcessInfo(p *Process, pid int) (int, string, error) {
 	pi, err := p.conn.queryProcessInfo(pid)
 	if err != nil {
 		return 0, "", err
@@ -501,31 +544,47 @@ func (p *Process) loadProcessInfo(pid int) (int, string, error) {
 	return pid, pi["name"], nil
 }
 
+// BinInfo returns information on the binary.
 func (p *Process) BinInfo() *proc.BinaryInfo {
-	return &p.bi
+	return p.bi
 }
 
+// Recorded returns whether or not we are debugging
+// a recorded "traced" program.
 func (p *Process) Recorded() (bool, string) {
 	return p.tracedir != "", p.tracedir
 }
 
+// Pid returns the process ID.
 func (p *Process) Pid() int {
 	return int(p.conn.pid)
 }
 
-func (p *Process) Exited() bool {
-	return p.exited
+// Valid returns true if we are not detached
+// and the process has not exited.
+func (p *Process) Valid() (bool, error) {
+	if p.detached {
+		return false, &proc.ProcessDetachedError{}
+	}
+	if p.exited {
+		return false, &proc.ErrProcessExited{Pid: p.Pid()}
+	}
+	return true, nil
 }
 
+// ResumeNotify specifies a channel that will be closed the next time
+// ContinueOnce finishes resuming the target.
 func (p *Process) ResumeNotify(ch chan<- struct{}) {
 	p.conn.resumeChan = ch
 }
 
+// FindThread returns the thread with the given ID.
 func (p *Process) FindThread(threadID int) (proc.Thread, bool) {
 	thread, ok := p.threads[threadID]
 	return thread, ok
 }
 
+// ThreadList returns all threads in the process.
 func (p *Process) ThreadList() []proc.Thread {
 	r := make([]proc.Thread, 0, len(p.threads))
 	for _, thread := range p.threads {
@@ -534,14 +593,18 @@ func (p *Process) ThreadList() []proc.Thread {
 	return r
 }
 
+// CurrentThread returns the current active
+// selected thread.
 func (p *Process) CurrentThread() proc.Thread {
 	return p.currentThread
 }
 
-func (p *Process) AllGCache() *[]*proc.G {
-	return &p.allGCache
+// Common returns common information across Process implementations.
+func (p *Process) Common() *proc.CommonProcess {
+	return &p.common
 }
 
+// SelectedGoroutine returns the current actuve selected goroutine.
 func (p *Process) SelectedGoroutine() *proc.G {
 	return p.selectedGoroutine
 }
@@ -549,19 +612,29 @@ func (p *Process) SelectedGoroutine() *proc.G {
 const (
 	interruptSignal  = 0x2
 	breakpointSignal = 0x5
+	faultSignal      = 0xb
 	childSignal      = 0x11
 	stopSignal       = 0x13
+
+	debugServerTargetExcBadAccess      = 0x91
+	debugServerTargetExcBadInstruction = 0x92
+	debugServerTargetExcArithmetic     = 0x93
+	debugServerTargetExcEmulation      = 0x94
+	debugServerTargetExcSoftware       = 0x95
+	debugServerTargetExcBreakpoint     = 0x96
 )
 
+// ContinueOnce will continue execution of the process until
+// a breakpoint is hit or signal is received.
 func (p *Process) ContinueOnce() (proc.Thread, error) {
 	if p.exited {
-		return nil, &proc.ProcessExitedError{Pid: p.conn.pid}
+		return nil, &proc.ErrProcessExited{Pid: p.conn.pid}
 	}
 
 	if p.conn.direction == proc.Forward {
 		// step threads stopped at any breakpoint over their breakpoint
 		for _, thread := range p.threads {
-			if thread.CurrentBreakpoint != nil {
+			if thread.CurrentBreakpoint.Breakpoint != nil {
 				if err := thread.stepInstruction(&threadUpdater{p: p}); err != nil {
 					return nil, err
 				}
@@ -569,7 +642,7 @@ func (p *Process) ContinueOnce() (proc.Thread, error) {
 		}
 	}
 
-	p.allGCache = nil
+	p.common.ClearAllGCache()
 	for _, th := range p.threads {
 		th.clearBreakpointState()
 	}
@@ -578,15 +651,15 @@ func (p *Process) ContinueOnce() (proc.Thread, error) {
 
 	// resume all threads
 	var threadID string
-	var sig uint8 = 0
+	var sig uint8
 	var tu = threadUpdater{p: p}
 	var err error
 continueLoop:
 	for {
-		tu.done = false
+		tu.Reset()
 		threadID, sig, err = p.conn.resume(sig, &tu)
 		if err != nil {
-			if _, exited := err.(proc.ProcessExitedError); exited {
+			if _, exited := err.(proc.ErrProcessExited); exited {
 				p.exited = true
 			}
 			return nil, err
@@ -614,8 +687,17 @@ continueLoop:
 		// The following are fake BSD-style signals sent by debugserver
 		// Unfortunately debugserver can not convert them into signals for the
 		// process so we must stop here.
-		case 0x91, 0x92, 0x93, 0x94, 0x95, 0x96: /* TARGET_EXC_BAD_ACCESS */
+		case debugServerTargetExcBadAccess, debugServerTargetExcBadInstruction, debugServerTargetExcArithmetic, debugServerTargetExcEmulation, debugServerTargetExcSoftware, debugServerTargetExcBreakpoint:
+
 			break continueLoop
+
+		// Signal 0 is returned by rr when it reaches the start of the process
+		// in backward continue mode.
+		case 0:
+			if p.conn.direction == proc.Backward {
+				break continueLoop
+			}
+
 		default:
 			// any other signal is always propagated to inferior
 		}
@@ -625,13 +707,19 @@ continueLoop:
 		return nil, err
 	}
 
+	if p.BinInfo().GOOS == "linux" {
+		if err := linutil.ElfUpdateSharedObjects(p); err != nil {
+			return nil, err
+		}
+	}
+
 	if err := p.setCurrentBreakpoints(); err != nil {
 		return nil, err
 	}
 
 	for _, thread := range p.threads {
 		if thread.strID == threadID {
-			var err error = nil
+			var err error
 			switch sig {
 			case 0x91:
 				err = errors.New("bad access")
@@ -653,6 +741,14 @@ continueLoop:
 	return nil, fmt.Errorf("could not find thread %s", threadID)
 }
 
+// SetSelectedGoroutine will set internally the goroutine that should be
+// the default for any command executed, the goroutine being actively
+// followed.
+func (p *Process) SetSelectedGoroutine(g *proc.G) {
+	p.selectedGoroutine = g
+}
+
+// StepInstruction will step exactly one CPU instruction.
 func (p *Process) StepInstruction() error {
 	thread := p.currentThread
 	if p.selectedGoroutine != nil {
@@ -664,16 +760,16 @@ func (p *Process) StepInstruction() error {
 		}
 		thread = p.selectedGoroutine.Thread.(*Thread)
 	}
-	p.allGCache = nil
+	p.common.ClearAllGCache()
 	if p.exited {
-		return &proc.ProcessExitedError{Pid: p.conn.pid}
+		return &proc.ErrProcessExited{Pid: p.conn.pid}
 	}
 	thread.clearBreakpointState()
 	err := thread.StepInstruction()
 	if err != nil {
 		return err
 	}
-	err = thread.SetCurrentBreakpoint()
+	err = thread.SetCurrentBreakpoint(true)
 	if err != nil {
 		return err
 	}
@@ -683,9 +779,10 @@ func (p *Process) StepInstruction() error {
 	return nil
 }
 
+// SwitchThread will change the internal selected thread.
 func (p *Process) SwitchThread(tid int) error {
 	if p.exited {
-		return proc.ProcessExitedError{Pid: p.conn.pid}
+		return proc.ErrProcessExited{Pid: p.conn.pid}
 	}
 	if th, ok := p.threads[tid]; ok {
 		p.currentThread = th
@@ -695,6 +792,7 @@ func (p *Process) SwitchThread(tid int) error {
 	return fmt.Errorf("thread %d does not exist", tid)
 }
 
+// SwitchGoroutine will change the internal selected goroutine.
 func (p *Process) SwitchGoroutine(gid int) error {
 	g, err := proc.FindGoroutine(p, gid)
 	if err != nil {
@@ -711,6 +809,8 @@ func (p *Process) SwitchGoroutine(gid int) error {
 	return nil
 }
 
+// RequestManualStop will attempt to stop the process
+// without a breakpoint or signal having been recieved.
 func (p *Process) RequestManualStop() error {
 	p.conn.manualStopMutex.Lock()
 	p.manualStopRequested = true
@@ -723,7 +823,9 @@ func (p *Process) RequestManualStop() error {
 	return p.conn.sendCtrlC()
 }
 
-func (p *Process) ManualStopRequested() bool {
+// CheckAndClearManualStopRequest will check for a manual
+// stop and then clear that state.
+func (p *Process) CheckAndClearManualStopRequest() bool {
 	p.conn.manualStopMutex.Lock()
 	msr := p.manualStopRequested
 	p.manualStopRequested = false
@@ -743,32 +845,16 @@ func (p *Process) getCtrlC() bool {
 	return p.ctrlC
 }
 
-func (p *Process) Halt() error {
-	if p.exited {
-		return nil
-	}
-	p.setCtrlC(true)
-	return p.conn.sendCtrlC()
-}
-
-func (p *Process) Kill() error {
-	if p.exited {
-		return nil
-	}
-	err := p.conn.kill()
-	if _, exited := err.(proc.ProcessExitedError); exited {
-		p.exited = true
-		return nil
-	}
-	return err
-}
-
+// Detach will detach from the target process,
+// if 'kill' is true it will also kill the process.
 func (p *Process) Detach(kill bool) error {
-	if kill {
-		if err := p.Kill(); err != nil {
-			if _, exited := err.(proc.ProcessExitedError); !exited {
+	if kill && !p.exited {
+		err := p.conn.kill()
+		if err != nil {
+			if _, exited := err.(proc.ErrProcessExited); !exited {
 				return err
 			}
+			p.exited = true
 		}
 	}
 	if !p.exited {
@@ -781,17 +867,22 @@ func (p *Process) Detach(kill bool) error {
 		<-p.waitChan
 		p.process = nil
 	}
+	p.detached = true
+	if p.onDetach != nil {
+		p.onDetach()
+	}
 	return p.bi.Close()
 }
 
+// Restart will restart the process from the given position.
 func (p *Process) Restart(pos string) error {
 	if p.tracedir == "" {
-		return proc.NotRecordedErr
+		return proc.ErrNotRecorded
 	}
 
 	p.exited = false
 
-	p.allGCache = nil
+	p.common.ClearAllGCache()
 	for _, th := range p.threads {
 		th.clearBreakpointState()
 	}
@@ -816,16 +907,18 @@ func (p *Process) Restart(pos string) error {
 	}
 	p.selectedGoroutine, _ = proc.GetG(p.CurrentThread())
 
-	for addr := range p.breakpoints {
+	for addr := range p.breakpoints.M {
 		p.conn.setBreakpoint(addr)
 	}
 
 	return p.setCurrentBreakpoints()
 }
 
+// When executes the 'when' command for the Mozilla RR backend.
+// This command will return rr's internal event number.
 func (p *Process) When() (string, error) {
 	if p.tracedir == "" {
-		return "", proc.NotRecordedErr
+		return "", proc.ErrNotRecorded
 	}
 	event, err := p.conn.qRRCmd("when")
 	if err != nil {
@@ -838,9 +931,10 @@ const (
 	checkpointPrefix = "Checkpoint "
 )
 
+// Checkpoint creates a checkpoint from which you can restart the program.
 func (p *Process) Checkpoint(where string) (int, error) {
 	if p.tracedir == "" {
-		return -1, proc.NotRecordedErr
+		return -1, proc.ErrNotRecorded
 	}
 	resp, err := p.conn.qRRCmd("checkpoint", where)
 	if err != nil {
@@ -865,9 +959,10 @@ func (p *Process) Checkpoint(where string) (int, error) {
 	return cpid, nil
 }
 
+// Checkpoints returns a list of all checkpoints set.
 func (p *Process) Checkpoints() ([]proc.Checkpoint, error) {
 	if p.tracedir == "" {
-		return nil, proc.NotRecordedErr
+		return nil, proc.ErrNotRecorded
 	}
 	resp, err := p.conn.qRRCmd("info checkpoints")
 	if err != nil {
@@ -887,16 +982,17 @@ func (p *Process) Checkpoints() ([]proc.Checkpoint, error) {
 		if err != nil {
 			return nil, fmt.Errorf("can not parse \"info checkpoints\" output line %q: %v", line, err)
 		}
-		r = append(r, proc.Checkpoint{cpid, fields[1], fields[2]})
+		r = append(r, proc.Checkpoint{ID: cpid, When: fields[1], Where: fields[2]})
 	}
 	return r, nil
 }
 
 const deleteCheckpointPrefix = "Deleted checkpoint "
 
+// ClearCheckpoint clears the checkpoint for the given ID.
 func (p *Process) ClearCheckpoint(id int) error {
 	if p.tracedir == "" {
-		return proc.NotRecordedErr
+		return proc.ErrNotRecorded
 	}
 	resp, err := p.conn.qRRCmd("delete checkpoint", strconv.Itoa(id))
 	if err != nil {
@@ -908,114 +1004,90 @@ func (p *Process) ClearCheckpoint(id int) error {
 	return nil
 }
 
+// Direction sets whether to run the program forwards or in reverse execution.
 func (p *Process) Direction(dir proc.Direction) error {
 	if p.tracedir == "" {
-		return proc.NotRecordedErr
+		return proc.ErrNotRecorded
 	}
 	if p.conn.conn == nil {
-		return proc.ProcessExitedError{Pid: p.conn.pid}
+		return proc.ErrProcessExited{Pid: p.conn.pid}
 	}
 	if p.conn.direction == dir {
 		return nil
 	}
-	for _, bp := range p.Breakpoints() {
-		if bp.Internal() {
-			return ErrDirChange
-		}
+	if p.Breakpoints().HasInternalBreakpoints() {
+		return ErrDirChange
 	}
 	p.conn.direction = dir
 	return nil
 }
 
-func (p *Process) Breakpoints() map[uint64]*proc.Breakpoint {
-	return p.breakpoints
+// Breakpoints returns the list of breakpoints currently set.
+func (p *Process) Breakpoints() *proc.BreakpointMap {
+	return &p.breakpoints
 }
 
+// FindBreakpoint returns the breakpoint at the given address.
 func (p *Process) FindBreakpoint(pc uint64) (*proc.Breakpoint, bool) {
-	// Check to see if address is past the breakpoint, (i.e. breakpoint was hit).
-	if bp, ok := p.breakpoints[pc-uint64(p.bi.Arch.BreakpointSize())]; ok {
-		return bp, true
-	}
 	// Directly use addr to lookup breakpoint.
-	if bp, ok := p.breakpoints[pc]; ok {
+	if bp, ok := p.breakpoints.M[pc]; ok {
 		return bp, true
 	}
 	return nil, false
 }
 
-func (p *Process) SetBreakpoint(addr uint64, kind proc.BreakpointKind, cond ast.Expr) (*proc.Breakpoint, error) {
-	if bp, ok := p.breakpoints[addr]; ok {
-		return bp, proc.BreakpointExistsError{bp.File, bp.Line, bp.Addr}
-	}
+func (p *Process) writeBreakpoint(addr uint64) (string, int, *proc.Function, []byte, error) {
 	f, l, fn := p.bi.PCToLine(uint64(addr))
-	if fn == nil {
-		return nil, proc.InvalidAddressError{Address: addr}
-	}
-
-	newBreakpoint := &proc.Breakpoint{
-		FunctionName: fn.Name,
-		File:         f,
-		Line:         l,
-		Addr:         addr,
-		Kind:         kind,
-		Cond:         cond,
-		HitCount:     map[int]uint64{},
-	}
-
-	if kind != proc.UserBreakpoint {
-		p.internalBreakpointIDCounter++
-		newBreakpoint.ID = p.internalBreakpointIDCounter
-	} else {
-		p.breakpointIDCounter++
-		newBreakpoint.ID = p.breakpointIDCounter
-	}
 
 	if err := p.conn.setBreakpoint(addr); err != nil {
-		return nil, err
+		return "", 0, nil, nil, err
 	}
-	p.breakpoints[addr] = newBreakpoint
-	return newBreakpoint, nil
+
+	return f, l, fn, nil, nil
 }
 
+// SetBreakpoint creates a new breakpoint.
+func (p *Process) SetBreakpoint(addr uint64, kind proc.BreakpointKind, cond ast.Expr) (*proc.Breakpoint, error) {
+	if p.exited {
+		return nil, &proc.ErrProcessExited{Pid: p.conn.pid}
+	}
+	return p.breakpoints.Set(addr, kind, cond, p.writeBreakpoint)
+}
+
+// ClearBreakpoint clears a breakpoint at the given address.
 func (p *Process) ClearBreakpoint(addr uint64) (*proc.Breakpoint, error) {
 	if p.exited {
-		return nil, &proc.ProcessExitedError{Pid: p.conn.pid}
+		return nil, &proc.ErrProcessExited{Pid: p.conn.pid}
 	}
-	bp := p.breakpoints[addr]
-	if bp == nil {
-		return nil, proc.NoBreakpointError{Addr: addr}
-	}
-
-	if err := p.conn.clearBreakpoint(addr); err != nil {
-		return nil, err
-	}
-
-	delete(p.breakpoints, addr)
-
-	return bp, nil
+	return p.breakpoints.Clear(addr, func(bp *proc.Breakpoint) error {
+		return p.conn.clearBreakpoint(bp.Addr)
+	})
 }
 
+// ClearInternalBreakpoints clear all internal use breakpoints like those set by 'next'.
 func (p *Process) ClearInternalBreakpoints() error {
-	for _, bp := range p.breakpoints {
-		if !bp.Internal() {
-			continue
-		}
-		if _, err := p.ClearBreakpoint(bp.Addr); err != nil {
+	return p.breakpoints.ClearInternalBreakpoints(func(bp *proc.Breakpoint) error {
+		if err := p.conn.clearBreakpoint(bp.Addr); err != nil {
 			return err
 		}
-	}
-	for i := range p.threads {
-		if p.threads[i].CurrentBreakpoint != nil && p.threads[i].CurrentBreakpoint.Internal() {
-			p.threads[i].CurrentBreakpoint = nil
+		for _, thread := range p.threads {
+			if thread.CurrentBreakpoint.Breakpoint == bp {
+				thread.clearBreakpointState()
+			}
 		}
-	}
-	return nil
+		return nil
+	})
 }
 
 type threadUpdater struct {
 	p    *Process
 	seen map[int]bool
 	done bool
+}
+
+func (tu *threadUpdater) Reset() {
+	tu.done = false
+	tu.seen = nil
 }
 
 func (tu *threadUpdater) Add(threads []string) error {
@@ -1122,7 +1194,7 @@ func (p *Process) setCurrentBreakpoints() error {
 	if p.threadStopInfo {
 		for _, th := range p.threads {
 			if th.setbp {
-				err := th.SetCurrentBreakpoint()
+				err := th.SetCurrentBreakpoint(true)
 				if err != nil {
 					return err
 				}
@@ -1131,8 +1203,8 @@ func (p *Process) setCurrentBreakpoints() error {
 	}
 	if !p.threadStopInfo {
 		for _, th := range p.threads {
-			if th.CurrentBreakpoint == nil {
-				err := th.SetCurrentBreakpoint()
+			if th.CurrentBreakpoint.Breakpoint == nil {
+				err := th.SetCurrentBreakpoint(true)
 				if err != nil {
 					return err
 				}
@@ -1142,6 +1214,7 @@ func (p *Process) setCurrentBreakpoints() error {
 	return nil
 }
 
+// ReadMemory will read into 'data' memory at the address provided.
 func (t *Thread) ReadMemory(data []byte, addr uintptr) (n int, err error) {
 	err = t.p.conn.readMemory(data, addr)
 	if err != nil {
@@ -1150,10 +1223,12 @@ func (t *Thread) ReadMemory(data []byte, addr uintptr) (n int, err error) {
 	return len(data), nil
 }
 
+// WriteMemory will write into the memory at 'addr' the data provided.
 func (t *Thread) WriteMemory(addr uintptr, data []byte) (written int, err error) {
 	return t.p.conn.writeMemory(addr, data)
 }
 
+// Location returns the current location of this thread.
 func (t *Thread) Location() (*proc.Location, error) {
 	regs, err := t.Registers(false)
 	if err != nil {
@@ -1164,39 +1239,55 @@ func (t *Thread) Location() (*proc.Location, error) {
 	return &proc.Location{PC: pc, File: f, Line: l, Fn: fn}, nil
 }
 
-func (t *Thread) Breakpoint() (breakpoint *proc.Breakpoint, active bool, condErr error) {
-	return t.CurrentBreakpoint, (t.CurrentBreakpoint != nil && t.BreakpointConditionMet), t.BreakpointConditionError
+// Breakpoint returns the current active breakpoint for this thread.
+func (t *Thread) Breakpoint() proc.BreakpointState {
+	return t.CurrentBreakpoint
 }
 
+// ThreadID returns this threads ID.
 func (t *Thread) ThreadID() int {
 	return t.ID
 }
 
+// Registers returns the CPU registers for this thread.
 func (t *Thread) Registers(floatingPoint bool) (proc.Registers, error) {
 	return &t.regs, nil
 }
 
+// RestoreRegisters will set the CPU registers the value of those provided.
+func (t *Thread) RestoreRegisters(savedRegs proc.Registers) error {
+	copy(t.regs.buf, savedRegs.(*gdbRegisters).buf)
+	return t.writeRegisters()
+}
+
+// Arch will return the CPU architecture for the target.
 func (t *Thread) Arch() proc.Arch {
 	return t.p.bi.Arch
 }
 
+// BinInfo will return information on the binary being debugged.
 func (t *Thread) BinInfo() *proc.BinaryInfo {
-	return &t.p.bi
+	return t.p.bi
+}
+
+// Common returns common information across Process implementations.
+func (t *Thread) Common() *proc.CommonThread {
+	return &t.common
 }
 
 func (t *Thread) stepInstruction(tu *threadUpdater) error {
 	pc := t.regs.PC()
-	if _, atbp := t.p.breakpoints[pc]; atbp {
+	if _, atbp := t.p.breakpoints.M[pc]; atbp {
 		err := t.p.conn.clearBreakpoint(pc)
 		if err != nil {
 			return err
 		}
 		defer t.p.conn.setBreakpoint(pc)
 	}
-	_, _, err := t.p.conn.step(t.strID, tu)
-	return err
+	return t.p.conn.step(t.strID, tu, false)
 }
 
+// StepInstruction will step exactly 1 CPU instruction.
 func (t *Thread) StepInstruction() error {
 	if err := t.stepInstruction(&threadUpdater{p: t.p}); err != nil {
 		return err
@@ -1204,6 +1295,7 @@ func (t *Thread) StepInstruction() error {
 	return t.reloadRegisters()
 }
 
+// Blocked returns true if the thread is blocked in runtime or kernel code.
 func (t *Thread) Blocked() bool {
 	regs, err := t.Registers(false)
 	if err != nil {
@@ -1224,8 +1316,9 @@ func (t *Thread) Blocked() bool {
 		return true
 	case "runtime.mach_semaphore_wait", "runtime.mach_semaphore_timedwait":
 		return true
+	default:
+		return strings.HasPrefix(fn.Name, "syscall.Syscall") || strings.HasPrefix(fn.Name, "syscall.RawSyscall")
 	}
-	return false
 }
 
 // loadGInstr returns the correct MOV instruction for the current
@@ -1234,15 +1327,12 @@ func (t *Thread) Blocked() bool {
 func (p *Process) loadGInstr() []byte {
 	var op []byte
 	switch p.bi.GOOS {
-	case "windows":
+	case "windows", "darwin", "freebsd":
 		// mov rcx, QWORD PTR gs:{uint32(off)}
 		op = []byte{0x65, 0x48, 0x8b, 0x0c, 0x25}
 	case "linux":
 		// mov rcx,QWORD PTR fs:{uint32(off)}
 		op = []byte{0x64, 0x48, 0x8B, 0x0C, 0x25}
-	case "darwin":
-		// mov rcx,QWORD PTR gs:{uint32(off)}
-		op = []byte{0x65, 0x48, 0x8B, 0x0C, 0x25}
 	default:
 		panic("unsupported operating system attempting to find Goroutine on Thread")
 	}
@@ -1252,25 +1342,29 @@ func (p *Process) loadGInstr() []byte {
 	return buf.Bytes()
 }
 
+func (regs *gdbRegisters) init(regsInfo []gdbRegisterInfo) {
+	regs.regs = make(map[string]gdbRegister)
+	regs.regsInfo = regsInfo
+
+	regsz := 0
+	for _, reginfo := range regsInfo {
+		if endoff := reginfo.Offset + (reginfo.Bitsize / 8); endoff > regsz {
+			regsz = endoff
+		}
+	}
+	regs.buf = make([]byte, regsz)
+	for _, reginfo := range regsInfo {
+		regs.regs[reginfo.Name] = gdbRegister{regnum: reginfo.Regnum, value: regs.buf[reginfo.Offset : reginfo.Offset+reginfo.Bitsize/8]}
+	}
+}
+
 // reloadRegisters loads the current value of the thread's registers.
 // It will also load the address of the thread's G.
 // Loading the address of G can be done in one of two ways reloadGAlloc, if
 // the stub can allocate memory, or reloadGAtPC, if the stub can't.
 func (t *Thread) reloadRegisters() error {
 	if t.regs.regs == nil {
-		t.regs.regs = make(map[string]gdbRegister)
-		t.regs.regsInfo = t.p.conn.regsInfo
-
-		regsz := 0
-		for _, reginfo := range t.p.conn.regsInfo {
-			if endoff := reginfo.Offset + (reginfo.Bitsize / 8); endoff > regsz {
-				regsz = endoff
-			}
-		}
-		t.regs.buf = make([]byte, regsz)
-		for _, reginfo := range t.p.conn.regsInfo {
-			t.regs.regs[reginfo.Name] = gdbRegister{regnum: reginfo.Regnum, value: t.regs.buf[reginfo.Offset : reginfo.Offset+reginfo.Bitsize/8]}
-		}
+		t.regs.init(t.p.conn.regsInfo)
 	}
 
 	if t.p.gcmdok {
@@ -1318,6 +1412,18 @@ func (t *Thread) writeSomeRegisters(regNames ...string) error {
 	return nil
 }
 
+func (t *Thread) writeRegisters() error {
+	if t.p.gcmdok {
+		return t.p.conn.writeRegisters(t.strID, t.regs.buf)
+	}
+	for _, r := range t.regs.regs {
+		if err := t.p.conn.writeRegister(t.strID, r.regnum, r.value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (t *Thread) readSomeRegisters(regNames ...string) error {
 	if t.p.gcmdok {
 		return t.p.conn.readRegisters(t.strID, t.regs.buf)
@@ -1354,7 +1460,7 @@ func (t *Thread) reloadGAtPC() error {
 	// around by clearing and re-setting the breakpoint in a specific sequence
 	// with the memory writes.
 	// Additionally all breakpoints in [pc, pc+len(movinstr)] need to be removed
-	for addr := range t.p.breakpoints {
+	for addr := range t.p.breakpoints.M {
 		if addr >= pc && addr <= pc+uint64(len(movinstr)) {
 			err := t.p.conn.clearBreakpoint(addr)
 			if err != nil {
@@ -1388,7 +1494,7 @@ func (t *Thread) reloadGAtPC() error {
 		}
 	}()
 
-	_, _, err = t.p.conn.step(t.strID, nil)
+	err = t.p.conn.step(t.strID, nil, true)
 	if err != nil {
 		if err == threadBlockedError {
 			t.regs.tls = 0
@@ -1441,7 +1547,7 @@ func (t *Thread) reloadGAlloc() error {
 		}
 	}()
 
-	_, _, err = t.p.conn.step(t.strID, nil)
+	err = t.p.conn.step(t.strID, nil, true)
 	if err != nil {
 		if err == threadBlockedError {
 			t.regs.tls = 0
@@ -1464,31 +1570,31 @@ func (t *Thread) reloadGAlloc() error {
 
 func (t *Thread) clearBreakpointState() {
 	t.setbp = false
-	t.CurrentBreakpoint = nil
-	t.BreakpointConditionMet = false
-	t.BreakpointConditionError = nil
+	t.CurrentBreakpoint.Clear()
 }
 
-func (thread *Thread) SetCurrentBreakpoint() error {
-	thread.CurrentBreakpoint = nil
-	regs, err := thread.Registers(false)
+// SetCurrentBreakpoint will find and set the threads current breakpoint.
+func (t *Thread) SetCurrentBreakpoint(adjustPC bool) error {
+	// adjustPC is ignored, it is the stub's responsibiility to set the PC
+	// address correctly after hitting a breakpoint.
+	t.clearBreakpointState()
+	regs, err := t.Registers(false)
 	if err != nil {
 		return err
 	}
 	pc := regs.PC()
-	if bp, ok := thread.p.FindBreakpoint(pc); ok {
-		if thread.regs.PC() != bp.Addr {
-			if err := thread.regs.SetPC(thread, bp.Addr); err != nil {
+	if bp, ok := t.p.FindBreakpoint(pc); ok {
+		if t.regs.PC() != bp.Addr {
+			if err := t.SetPC(bp.Addr); err != nil {
 				return err
 			}
 		}
-		thread.CurrentBreakpoint = bp
-		thread.BreakpointConditionMet, thread.BreakpointConditionError = bp.CheckCondition(thread)
-		if thread.CurrentBreakpoint != nil && thread.BreakpointConditionMet {
-			if g, err := proc.GetG(thread); err == nil {
-				thread.CurrentBreakpoint.HitCount[g.ID]++
+		t.CurrentBreakpoint = bp.CheckCondition(t)
+		if t.CurrentBreakpoint.Breakpoint != nil && t.CurrentBreakpoint.Active {
+			if g, err := proc.GetG(t); err == nil {
+				t.CurrentBreakpoint.HitCount[g.ID]++
 			}
-			thread.CurrentBreakpoint.TotalHitCount++
+			t.CurrentBreakpoint.TotalHitCount++
 		}
 	}
 	return nil
@@ -1504,6 +1610,13 @@ func (regs *gdbRegisters) setPC(value uint64) {
 
 func (regs *gdbRegisters) SP() uint64 {
 	return binary.LittleEndian.Uint64(regs.regs[regnameSP].value)
+}
+func (regs *gdbRegisters) setSP(value uint64) {
+	binary.LittleEndian.PutUint64(regs.regs[regnameSP].value, value)
+}
+
+func (regs *gdbRegisters) setDX(value uint64) {
+	binary.LittleEndian.PutUint64(regs.regs[regnameDX].value, value)
 }
 
 func (regs *gdbRegisters) BP() uint64 {
@@ -1688,22 +1801,45 @@ func (regs *gdbRegisters) Get(n int) (uint64, error) {
 		return regs.byName("r15"), nil
 	}
 
-	return 0, proc.UnknownRegisterError
+	return 0, proc.ErrUnknownRegister
 }
 
-func (regs *gdbRegisters) SetPC(thread proc.Thread, pc uint64) error {
-	regs.setPC(pc)
-	t := thread.(*Thread)
+// SetPC will set the value of the PC register to the given value.
+func (t *Thread) SetPC(pc uint64) error {
+	t.regs.setPC(pc)
 	if t.p.gcmdok {
 		return t.p.conn.writeRegisters(t.strID, t.regs.buf)
 	}
-	reg := regs.regs[regnamePC]
+	reg := t.regs.regs[regnamePC]
 	return t.p.conn.writeRegister(t.strID, reg.regnum, reg.value)
 }
 
-func (regs *gdbRegisters) Slice() []proc.Register {
+// SetSP will set the value of the SP register to the given value.
+func (t *Thread) SetSP(sp uint64) error {
+	t.regs.setSP(sp)
+	if t.p.gcmdok {
+		return t.p.conn.writeRegisters(t.strID, t.regs.buf)
+	}
+	reg := t.regs.regs[regnameSP]
+	return t.p.conn.writeRegister(t.strID, reg.regnum, reg.value)
+}
+
+// SetDX will set the value of the DX register to the given value.
+func (t *Thread) SetDX(dx uint64) error {
+	t.regs.setDX(dx)
+	if t.p.gcmdok {
+		return t.p.conn.writeRegisters(t.strID, t.regs.buf)
+	}
+	reg := t.regs.regs[regnameDX]
+	return t.p.conn.writeRegister(t.strID, reg.regnum, reg.value)
+}
+
+func (regs *gdbRegisters) Slice(floatingPoint bool) []proc.Register {
 	r := make([]proc.Register, 0, len(regs.regsInfo))
 	for _, reginfo := range regs.regsInfo {
+		if reginfo.Group == "float" && !floatingPoint {
+			continue
+		}
 		switch {
 		case reginfo.Name == "eflags":
 			r = proc.AppendEflagReg(r, reginfo.Name, uint64(binary.LittleEndian.Uint32(regs.regs[reginfo.Name].value)))
@@ -1716,6 +1852,9 @@ func (regs *gdbRegisters) Slice() []proc.Register {
 		case reginfo.Bitsize == 64:
 			r = proc.AppendQwordReg(r, reginfo.Name, binary.LittleEndian.Uint64(regs.regs[reginfo.Name].value))
 		case reginfo.Bitsize == 80:
+			if !floatingPoint {
+				continue
+			}
 			idx := 0
 			for _, stprefix := range []string{"stmm", "st"} {
 				if strings.HasPrefix(reginfo.Name, stprefix) {
@@ -1727,10 +1866,12 @@ func (regs *gdbRegisters) Slice() []proc.Register {
 			r = proc.AppendX87Reg(r, idx, binary.LittleEndian.Uint16(value[8:]), binary.LittleEndian.Uint64(value[:8]))
 
 		case reginfo.Bitsize == 128:
-			r = proc.AppendSSEReg(r, strings.ToUpper(reginfo.Name), regs.regs[reginfo.Name].value)
+			if floatingPoint {
+				r = proc.AppendSSEReg(r, strings.ToUpper(reginfo.Name), regs.regs[reginfo.Name].value)
+			}
 
 		case reginfo.Bitsize == 256:
-			if !strings.HasPrefix(strings.ToLower(reginfo.Name), "ymm") {
+			if !strings.HasPrefix(strings.ToLower(reginfo.Name), "ymm") || !floatingPoint {
 				continue
 			}
 
@@ -1741,4 +1882,11 @@ func (regs *gdbRegisters) Slice() []proc.Register {
 		}
 	}
 	return r
+}
+
+func (regs *gdbRegisters) Copy() proc.Registers {
+	savedRegs := &gdbRegisters{}
+	savedRegs.init(regs.regsInfo)
+	copy(savedRegs.buf, regs.buf)
+	return savedRegs
 }
