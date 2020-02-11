@@ -10,12 +10,14 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/spf13/cobra"
 )
 
 const DelveMainPackagePath = "github.com/go-delve/delve/cmd/dlv"
 
 var Verbose bool
+var NOTimeout bool
 var TestSet, TestRegex, TestBackend, TestBuildMode string
 
 func NewMakeCommands() *cobra.Command {
@@ -70,7 +72,7 @@ func NewMakeCommands() *cobra.Command {
 Use the flags -s, -r and -b to specify which tests to run. Specifying nothing is equivalent to:
 
 	go run scripts/make.go test -s all -b default
-	go run scripts/make.go test -s basic -b lldb    # if lldb-server is installed
+	go run scripts/make.go test -s basic -b lldb    # if lldb-server is installed and Go < 1.14
 	go run scripts/make.go test -s basic -b rr      # if rr is installed
 	
 	go run scripts/make.go test -s basic -m pie     # only on linux
@@ -80,6 +82,7 @@ Use the flags -s, -r and -b to specify which tests to run. Specifying nothing is
 		Run: testCmd,
 	}
 	test.PersistentFlags().BoolVarP(&Verbose, "verbose", "v", false, "Verbose tests")
+	test.PersistentFlags().BoolVarP(&NOTimeout, "timeout", "t", false, "Set infinite timeouts")
 	test.PersistentFlags().StringVarP(&TestSet, "test-set", "s", "", `Select the set of tests to run, one of either:
 	all		tests all packages
 	basic		tests proc, integration and terminal
@@ -187,7 +190,7 @@ func quotemaybe(args []string) []string {
 func getoutput(cmd string, args ...interface{}) string {
 	x := exec.Command(cmd, strflatten(args)...)
 	x.Env = os.Environ()
-	out, err := x.CombinedOutput()
+	out, err := x.Output()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -259,6 +262,10 @@ func testFlags() []string {
 	if Verbose {
 		testFlags = append(testFlags, "-v")
 	}
+	if NOTimeout {
+		testFlags = append(testFlags, "-timeout")
+		testFlags = append(testFlags, "0")
+	}
 	if runtime.GOOS == "darwin" {
 		testFlags = append(testFlags, "-exec="+wd+"/scripts/testsign")
 	}
@@ -289,7 +296,7 @@ func testCmd(cmd *cobra.Command, args []string) {
 
 		fmt.Println("Testing default backend")
 		testCmdIntl("all", "", "default", "normal")
-		if inpath("lldb-server") {
+		if inpath("lldb-server") && !goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
 			fmt.Println("\nTesting LLDB backend")
 			testCmdIntl("basic", "", "lldb", "normal")
 		}

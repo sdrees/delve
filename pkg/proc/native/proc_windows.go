@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -36,7 +37,7 @@ func openExecutablePathPE(path string) (*pe.File, io.Closer, error) {
 }
 
 // Launch creates and begins debugging a new process.
-func Launch(cmd []string, wd string, foreground bool, _ []string) (*Process, error) {
+func Launch(cmd []string, wd string, foreground bool, _ []string) (*proc.Target, error) {
 	argv0Go, err := filepath.Abs(cmd[0])
 	if err != nil {
 		return nil, err
@@ -55,9 +56,17 @@ func Launch(cmd []string, wd string, foreground bool, _ []string) (*Process, err
 	}
 	closer.Close()
 
+	env := os.Environ()
+	for i := range env {
+		if strings.HasPrefix(env[i], "GODEBUG=") {
+			// Go 1.14 asynchronous preemption mechanism is incompatible with
+			// debuggers, see: https://github.com/golang/go/issues/36494
+			env[i] += ",asyncpreemptoff=1"
+		}
+	}
+
 	var p *os.Process
 	dbp := New(0)
-	dbp.common = proc.NewCommonProcess(true)
 	dbp.execPtraceFunc(func() {
 		attr := &os.ProcAttr{
 			Dir:   wd,
@@ -65,6 +74,7 @@ func Launch(cmd []string, wd string, foreground bool, _ []string) (*Process, err
 			Sys: &syscall.SysProcAttr{
 				CreationFlags: _DEBUG_ONLY_THIS_PROCESS,
 			},
+			Env: env,
 		}
 		p, err = os.StartProcess(argv0Go, cmd, attr)
 	})
@@ -80,7 +90,7 @@ func Launch(cmd []string, wd string, foreground bool, _ []string) (*Process, err
 		dbp.Detach(true)
 		return nil, err
 	}
-	return dbp, nil
+	return proc.NewTarget(dbp, true), nil
 }
 
 func initialize(dbp *Process) error {
@@ -151,9 +161,13 @@ func findExePath(pid int) (string, error) {
 }
 
 // Attach to an existing process with the given PID.
-func Attach(pid int, _ []string) (*Process, error) {
-	// TODO: Probably should have SeDebugPrivilege before starting here.
-	err := _DebugActiveProcess(uint32(pid))
+func Attach(pid int, _ []string) (*proc.Target, error) {
+	dbp := New(pid)
+	var err error
+	dbp.execPtraceFunc(func() {
+		// TODO: Probably should have SeDebugPrivilege before starting here.
+		err = _DebugActiveProcess(uint32(pid))
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -161,12 +175,11 @@ func Attach(pid int, _ []string) (*Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	dbp := New(pid)
 	if err = dbp.initialize(exepath, []string{}); err != nil {
 		dbp.Detach(true)
 		return nil, err
 	}
-	return dbp, nil
+	return proc.NewTarget(dbp, true), nil
 }
 
 // kill kills the process.
@@ -470,6 +483,8 @@ func (dbp *Process) stop(trapthread *Thread) (err error) {
 
 func (dbp *Process) detach(kill bool) error {
 	if !kill {
+		//TODO(aarzilli): when debug.Target exist Detach should be moved to
+		// debug.Target and the call to RestoreAsyncPreempt should be moved there.
 		for _, thread := range dbp.threads {
 			_, err := _ResumeThread(thread.os.hThread)
 			if err != nil {

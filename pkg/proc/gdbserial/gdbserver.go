@@ -126,7 +126,6 @@ type Process struct {
 
 	onDetach func() // called after a successful detach
 
-	common proc.CommonProcess
 }
 
 // Thread represents an operating system thread.
@@ -136,7 +135,8 @@ type Thread struct {
 	regs              gdbRegisters
 	CurrentBreakpoint proc.BreakpointState
 	p                 *Process
-	setbp             bool // thread was stopped because of a breakpoint
+	sig               uint8 // signal received by thread after last stop
+	setbp             bool  // thread was stopped because of a breakpoint
 	common            proc.CommonThread
 }
 
@@ -184,7 +184,6 @@ func New(process *os.Process) *Process {
 		gcmdok:         true,
 		threadStopInfo: true,
 		process:        process,
-		common:         proc.NewCommonProcess(true),
 	}
 
 	if process != nil {
@@ -320,7 +319,7 @@ func getLdEnvVars() []string {
 // LLDBLaunch starts an instance of lldb-server and connects to it, asking
 // it to launch the specified target program with the specified arguments
 // (cmd) on the specified directory wd.
-func LLDBLaunch(cmd []string, wd string, foreground bool, debugInfoDirs []string) (*Process, error) {
+func LLDBLaunch(cmd []string, wd string, foreground bool, debugInfoDirs []string) (*proc.Target, error) {
 	switch runtime.GOOS {
 	case "windows":
 		return nil, ErrUnsupportedOS
@@ -343,7 +342,7 @@ func LLDBLaunch(cmd []string, wd string, foreground bool, debugInfoDirs []string
 
 	var listener net.Listener
 	var port string
-	var proc *exec.Cmd
+	var process *exec.Cmd
 	if _, err := os.Stat(debugserverExecutable); err == nil {
 		listener, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -355,12 +354,15 @@ func LLDBLaunch(cmd []string, wd string, foreground bool, debugInfoDirs []string
 		if foreground {
 			args = append(args, "--stdio-path", "/dev/tty")
 		}
+		if logflags.LLDBServerOutput() {
+			args = append(args, "-g", "-l", "stdout")
+		}
 		args = append(args, "-F", "-R", fmt.Sprintf("127.0.0.1:%d", listener.Addr().(*net.TCPAddr).Port), "--")
 		args = append(args, cmd...)
 
 		isDebugserver = true
 
-		proc = exec.Command(debugserverExecutable, args...)
+		process = exec.Command(debugserverExecutable, args...)
 	} else {
 		if _, err := exec.LookPath("lldb-server"); err != nil {
 			return nil, &ErrBackendUnavailable{}
@@ -371,29 +373,29 @@ func LLDBLaunch(cmd []string, wd string, foreground bool, debugInfoDirs []string
 		args = append(args, port, "--")
 		args = append(args, cmd...)
 
-		proc = exec.Command("lldb-server", args...)
+		process = exec.Command("lldb-server", args...)
 	}
 
 	if logflags.LLDBServerOutput() || logflags.GdbWire() || foreground {
-		proc.Stdout = os.Stdout
-		proc.Stderr = os.Stderr
+		process.Stdout = os.Stdout
+		process.Stderr = os.Stderr
 	}
 	if foreground {
 		foregroundSignalsIgnore()
-		proc.Stdin = os.Stdin
+		process.Stdin = os.Stdin
 	}
 	if wd != "" {
-		proc.Dir = wd
+		process.Dir = wd
 	}
 
-	proc.SysProcAttr = sysProcAttr(foreground)
+	process.SysProcAttr = sysProcAttr(foreground)
 
-	err := proc.Start()
+	err := process.Start()
 	if err != nil {
 		return nil, err
 	}
 
-	p := New(proc.Process)
+	p := New(process.Process)
 	p.conn.isDebugserver = isDebugserver
 
 	if listener != nil {
@@ -404,7 +406,7 @@ func LLDBLaunch(cmd []string, wd string, foreground bool, debugInfoDirs []string
 	if err != nil {
 		return nil, err
 	}
-	return p, nil
+	return proc.NewTarget(p, false), nil
 }
 
 // LLDBAttach starts an instance of lldb-server and connects to it, asking
@@ -412,7 +414,7 @@ func LLDBLaunch(cmd []string, wd string, foreground bool, debugInfoDirs []string
 // Path is path to the target's executable, path only needs to be specified
 // for some stubs that do not provide an automated way of determining it
 // (for example debugserver).
-func LLDBAttach(pid int, path string, debugInfoDirs []string) (*Process, error) {
+func LLDBAttach(pid int, path string, debugInfoDirs []string) (*proc.Target, error) {
 	if runtime.GOOS == "windows" {
 		return nil, ErrUnsupportedOS
 	}
@@ -456,7 +458,7 @@ func LLDBAttach(pid int, path string, debugInfoDirs []string) (*Process, error) 
 	if err != nil {
 		return nil, err
 	}
-	return p, nil
+	return proc.NewTarget(p, false), nil
 }
 
 // EntryPoint will return the process entry point address, useful for
@@ -599,11 +601,6 @@ func (p *Process) CurrentThread() proc.Thread {
 	return p.currentThread
 }
 
-// Common returns common information across Process implementations.
-func (p *Process) Common() *proc.CommonProcess {
-	return &p.common
-}
-
 // SelectedGoroutine returns the current actuve selected goroutine.
 func (p *Process) SelectedGoroutine() *proc.G {
 	return p.selectedGoroutine
@@ -642,7 +639,6 @@ func (p *Process) ContinueOnce() (proc.Thread, error) {
 		}
 	}
 
-	p.common.ClearAllGCache()
 	for _, th := range p.threads {
 		th.clearBreakpointState()
 	}
@@ -651,13 +647,15 @@ func (p *Process) ContinueOnce() (proc.Thread, error) {
 
 	// resume all threads
 	var threadID string
-	var sig uint8
+	var trapthread *Thread
 	var tu = threadUpdater{p: p}
-	var err error
 continueLoop:
 	for {
+		var err error
+		var sig uint8
 		tu.Reset()
-		threadID, sig, err = p.conn.resume(sig, &tu)
+		//TODO: pass thread list to resume, which should use it to pass the correct signals
+		threadID, sig, err = p.conn.resume(p.threads, &tu)
 		if err != nil {
 			if _, exited := err.(proc.ErrProcessExited); exited {
 				p.exited = true
@@ -665,45 +663,25 @@ continueLoop:
 			return nil, err
 		}
 
-		// 0x5 is always a breakpoint, a manual stop either manifests as 0x13
-		// (lldb), 0x11 (debugserver) or 0x2 (gdbserver).
-		// Since 0x2 could also be produced by the user
-		// pressing ^C (in which case it should be passed to the inferior) we need
-		// the ctrlC flag to know that we are the originators.
-		switch sig {
-		case interruptSignal: // interrupt
-			if p.getCtrlC() {
-				break continueLoop
-			}
-		case breakpointSignal: // breakpoint
+		// For stubs that support qThreadStopInfo updateThreadListNoRegisters will
+		// find out the reason why each thread stopped.
+		p.updateThreadListNoRegisters(&tu)
+
+		trapthread = p.findThreadByStrID(threadID)
+		if trapthread != nil && !p.threadStopInfo {
+			// For stubs that do not support qThreadStopInfo we manually set the
+			// reason the thread returned by resume() stopped.
+			trapthread.sig = sig
+		}
+
+		var shouldStop bool
+		trapthread, shouldStop = p.handleThreadSignals(trapthread)
+		if shouldStop {
 			break continueLoop
-		case childSignal: // stop on debugserver but SIGCHLD on lldb-server/linux
-			if p.conn.isDebugserver {
-				break continueLoop
-			}
-		case stopSignal: // stop
-			break continueLoop
-
-		// The following are fake BSD-style signals sent by debugserver
-		// Unfortunately debugserver can not convert them into signals for the
-		// process so we must stop here.
-		case debugServerTargetExcBadAccess, debugServerTargetExcBadInstruction, debugServerTargetExcArithmetic, debugServerTargetExcEmulation, debugServerTargetExcSoftware, debugServerTargetExcBreakpoint:
-
-			break continueLoop
-
-		// Signal 0 is returned by rr when it reaches the start of the process
-		// in backward continue mode.
-		case 0:
-			if p.conn.direction == proc.Backward {
-				break continueLoop
-			}
-
-		default:
-			// any other signal is always propagated to inferior
 		}
 	}
 
-	if err := p.updateThreadList(&tu); err != nil {
+	if err := p.updateThreadRegisters(); err != nil {
 		return nil, err
 	}
 
@@ -717,28 +695,115 @@ continueLoop:
 		return nil, err
 	}
 
+	if trapthread == nil {
+		return nil, fmt.Errorf("could not find thread %s", threadID)
+	}
+
+	var err error
+	switch trapthread.sig {
+	case 0x91:
+		err = errors.New("bad access")
+	case 0x92:
+		err = errors.New("bad instruction")
+	case 0x93:
+		err = errors.New("arithmetic exception")
+	case 0x94:
+		err = errors.New("emulation exception")
+	case 0x95:
+		err = errors.New("software exception")
+	case 0x96:
+		err = errors.New("breakpoint exception")
+	}
+	if err != nil {
+		// the signals that are reported here can not be propagated back to the target process.
+		trapthread.sig = 0
+	}
+	return trapthread, err
+}
+
+func (p *Process) findThreadByStrID(threadID string) *Thread {
 	for _, thread := range p.threads {
 		if thread.strID == threadID {
-			var err error
-			switch sig {
-			case 0x91:
-				err = errors.New("bad access")
-			case 0x92:
-				err = errors.New("bad instruction")
-			case 0x93:
-				err = errors.New("arithmetic exception")
-			case 0x94:
-				err = errors.New("emulation exception")
-			case 0x95:
-				err = errors.New("software exception")
-			case 0x96:
-				err = errors.New("breakpoint exception")
+			return thread
+		}
+	}
+	return nil
+}
+
+// handleThreadSignals looks at the signals received by each thread and
+// decides which ones to mask and which ones to propagate back to the target
+// and returns true if we should stop execution in response to one of the
+// signals and return control to the user.
+// Adjusts trapthread to a thread that we actually want to stop at.
+func (p *Process) handleThreadSignals(trapthread *Thread) (trapthreadOut *Thread, shouldStop bool) {
+	var trapthreadCandidate *Thread
+
+	for _, th := range p.threads {
+		isStopSignal := false
+
+		// 0x5 is always a breakpoint, a manual stop either manifests as 0x13
+		// (lldb), 0x11 (debugserver) or 0x2 (gdbserver).
+		// Since 0x2 could also be produced by the user
+		// pressing ^C (in which case it should be passed to the inferior) we need
+		// the ctrlC flag to know that we are the originators.
+		switch th.sig {
+		case interruptSignal: // interrupt
+			if p.getCtrlC() {
+				isStopSignal = true
 			}
-			return thread, err
+		case breakpointSignal: // breakpoint
+			isStopSignal = true
+		case childSignal: // stop on debugserver but SIGCHLD on lldb-server/linux
+			if p.conn.isDebugserver {
+				isStopSignal = true
+			}
+		case stopSignal: // stop
+			isStopSignal = true
+
+		// The following are fake BSD-style signals sent by debugserver
+		// Unfortunately debugserver can not convert them into signals for the
+		// process so we must stop here.
+		case debugServerTargetExcBadAccess, debugServerTargetExcBadInstruction, debugServerTargetExcArithmetic, debugServerTargetExcEmulation, debugServerTargetExcSoftware, debugServerTargetExcBreakpoint:
+
+			trapthreadCandidate = th
+			shouldStop = true
+
+		// Signal 0 is returned by rr when it reaches the start of the process
+		// in backward continue mode.
+		case 0:
+			if p.conn.direction == proc.Backward {
+				isStopSignal = true
+			}
+
+		default:
+			// any other signal is always propagated to inferior
+		}
+
+		if isStopSignal {
+			if trapthreadCandidate == nil {
+				trapthreadCandidate = th
+			}
+			th.sig = 0
+			shouldStop = true
 		}
 	}
 
-	return nil, fmt.Errorf("could not find thread %s", threadID)
+	if (trapthread == nil || trapthread.sig != 0) && trapthreadCandidate != nil {
+		// proc.Continue wants us to return one of the threads that we should stop
+		// at, if the thread returned by vCont received a signal that we want to
+		// propagate back to the target thread but there were also other threads
+		// that we wish to stop at we should pick one of those.
+		trapthread = trapthreadCandidate
+	}
+
+	if p.getCtrlC() || p.getManualStopRequested() {
+		// If we request an interrupt and a target thread simultaneously receives
+		// an unrelated singal debugserver will discard our interrupt request and
+		// report the signal but we should stop anyway.
+		shouldStop = true
+	}
+
+	return trapthread, shouldStop
 }
 
 // SetSelectedGoroutine will set internally the goroutine that should be
@@ -746,37 +811,6 @@ continueLoop:
 // followed.
 func (p *Process) SetSelectedGoroutine(g *proc.G) {
 	p.selectedGoroutine = g
-}
-
-// StepInstruction will step exactly one CPU instruction.
-func (p *Process) StepInstruction() error {
-	thread := p.currentThread
-	if p.selectedGoroutine != nil {
-		if p.selectedGoroutine.Thread == nil {
-			if _, err := p.SetBreakpoint(p.selectedGoroutine.PC, proc.NextBreakpoint, proc.SameGoroutineCondition(p.selectedGoroutine)); err != nil {
-				return err
-			}
-			return proc.Continue(p)
-		}
-		thread = p.selectedGoroutine.Thread.(*Thread)
-	}
-	p.common.ClearAllGCache()
-	if p.exited {
-		return &proc.ErrProcessExited{Pid: p.conn.pid}
-	}
-	thread.clearBreakpointState()
-	err := thread.StepInstruction()
-	if err != nil {
-		return err
-	}
-	err = thread.SetCurrentBreakpoint(true)
-	if err != nil {
-		return err
-	}
-	if g, _ := proc.GetG(thread); g != nil {
-		p.selectedGoroutine = g
-	}
-	return nil
 }
 
 // SwitchThread will change the internal selected thread.
@@ -793,13 +827,8 @@ func (p *Process) SwitchThread(tid int) error {
 }
 
 // SwitchGoroutine will change the internal selected goroutine.
-func (p *Process) SwitchGoroutine(gid int) error {
-	g, err := proc.FindGoroutine(p, gid)
-	if err != nil {
-		return err
-	}
+func (p *Process) SwitchGoroutine(g *proc.G) error {
 	if g == nil {
-		// user specified -1 and selectedGoroutine is nil
 		return nil
 	}
 	if g.Thread != nil {
@@ -829,6 +858,13 @@ func (p *Process) CheckAndClearManualStopRequest() bool {
 	p.conn.manualStopMutex.Lock()
 	msr := p.manualStopRequested
 	p.manualStopRequested = false
+	p.conn.manualStopMutex.Unlock()
+	return msr
+}
+
+func (p *Process) getManualStopRequested() bool {
+	p.conn.manualStopMutex.Lock()
+	msr := p.manualStopRequested
 	p.conn.manualStopMutex.Unlock()
 	return msr
 }
@@ -882,7 +918,6 @@ func (p *Process) Restart(pos string) error {
 
 	p.exited = false
 
-	p.common.ClearAllGCache()
 	for _, th := range p.threads {
 		th.clearBreakpointState()
 	}
@@ -896,7 +931,7 @@ func (p *Process) Restart(pos string) error {
 
 	// for some reason we have to send a vCont;c after a vRun to make rr behave
 	// properly, because that's what gdb does.
-	_, _, err = p.conn.resume(0, nil)
+	_, _, err = p.conn.resume(nil, nil)
 	if err != nil {
 		return err
 	}
@@ -1123,7 +1158,7 @@ func (tu *threadUpdater) Finish() {
 			continue
 		}
 		delete(tu.p.threads, threadID)
-		if tu.p.currentThread.ID == threadID {
+		if tu.p.currentThread != nil && tu.p.currentThread.ID == threadID {
 			tu.p.currentThread = nil
 		}
 	}
@@ -1141,14 +1176,13 @@ func (tu *threadUpdater) Finish() {
 	}
 }
 
-// updateThreadsList retrieves the list of inferior threads from the stub
-// and passes it to the threadUpdater.
-// Then it reloads the register information for all running threads.
+// updateThreadListNoRegisters retrieves the list of inferior threads from
+// the stub and passes it to threadUpdater.
 // Some stubs will return the list of running threads in the stop packet, if
 // this happens the threadUpdater will know that we have already updated the
 // thread list and the first step of updateThreadList will be skipped.
 // Registers are always reloaded.
-func (p *Process) updateThreadList(tu *threadUpdater) error {
+func (p *Process) updateThreadListNoRegisters(tu *threadUpdater) error {
 	if !tu.done {
 		first := true
 		for {
@@ -1168,8 +1202,8 @@ func (p *Process) updateThreadList(tu *threadUpdater) error {
 		tu.Finish()
 	}
 
-	if p.threadStopInfo {
-		for _, th := range p.threads {
+	for _, th := range p.threads {
+		if p.threadStopInfo {
 			sig, reason, err := p.conn.threadStopInfo(th.strID)
 			if err != nil {
 				if isProtocolErrorUnsupported(err) {
@@ -1179,15 +1213,42 @@ func (p *Process) updateThreadList(tu *threadUpdater) error {
 				return err
 			}
 			th.setbp = (reason == "breakpoint" || (reason == "" && sig == breakpointSignal))
+			th.sig = sig
+		} else {
+			th.sig = 0
 		}
 	}
 
+	return nil
+}
+
+// updateThreadRegisters reloads register informations for all running
+// threads.
+func (p *Process) updateThreadRegisters() error {
 	for _, thread := range p.threads {
 		if err := thread.reloadRegisters(); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// updateThreadsList retrieves the list of inferior threads from the stub
+// and passes it to the threadUpdater.
+// Then it reloads the register information for all running threads.
+// Some stubs will return the list of running threads in the stop packet, if
+// this happens the threadUpdater will know that we have already updated the
+// thread list and the first step of updateThreadList will be skipped.
+// Registers are always reloaded.
+func (p *Process) updateThreadList(tu *threadUpdater) error {
+	err := p.updateThreadListNoRegisters(tu)
+	if err != nil {
+		return err
+	}
+	for _, th := range p.threads {
+		th.sig = 0
+	}
+	return p.updateThreadRegisters()
 }
 
 func (p *Process) setCurrentBreakpoints() error {
@@ -1240,8 +1301,8 @@ func (t *Thread) Location() (*proc.Location, error) {
 }
 
 // Breakpoint returns the current active breakpoint for this thread.
-func (t *Thread) Breakpoint() proc.BreakpointState {
-	return t.CurrentBreakpoint
+func (t *Thread) Breakpoint() *proc.BreakpointState {
+	return &t.CurrentBreakpoint
 }
 
 // ThreadID returns this threads ID.

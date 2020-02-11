@@ -190,6 +190,7 @@ type G struct {
 	PC         uint64 // PC of goroutine when it was parked.
 	SP         uint64 // SP of goroutine when it was parked.
 	BP         uint64 // BP of goroutine when it was parked (go >= 1.7).
+	LR         uint64 // LR of goroutine when it was parked.
 	GoPC       uint64 // PC of 'go' statement that created this goroutine.
 	StartPC    uint64 // PC of the first function run on this goroutine.
 	WaitReason string // Reason for goroutine being parked.
@@ -210,6 +211,8 @@ type G struct {
 	variable *Variable
 
 	Unreadable error // could not read the G struct
+
+	labels *map[string]string // G's pprof labels, computed on demand in Labels() method
 }
 
 // Defer returns the top-most defer of the goroutine.
@@ -264,6 +267,32 @@ func (g *G) Go() Location {
 func (g *G) StartLoc() Location {
 	f, l, fn := g.variable.bi.PCToLine(g.StartPC)
 	return Location{PC: g.StartPC, File: f, Line: l, Fn: fn}
+}
+
+func (g *G) Labels() map[string]string {
+	if g.labels != nil {
+		return *g.labels
+	}
+	var labels map[string]string
+	if labelsVar := g.variable.loadFieldNamed("labels"); labelsVar != nil && len(labelsVar.Children) == 1 {
+		if address := labelsVar.Children[0]; address.Addr != 0 {
+			labelMapType, _ := g.variable.bi.findType("runtime/pprof.labelMap")
+			if labelMapType != nil {
+				labelMap := newVariable("", address.Addr, labelMapType, g.variable.bi, g.variable.mem)
+				labelMap.loadValue(loadFullValue)
+				labels = map[string]string{}
+				for i := range labelMap.Children {
+					if i%2 == 0 {
+						k := labelMap.Children[i]
+						v := labelMap.Children[i+1]
+						labels[constant.StringVal(k.Value)] = constant.StringVal(v.Value)
+					}
+				}
+			}
+		}
+	}
+	g.labels = &labels
+	return *g.labels
 }
 
 type Ancestor struct {
@@ -495,12 +524,11 @@ func (v *Variable) parseG() (*G, error) {
 	_, deref := v.RealType.(*godwarf.PtrType)
 
 	if deref {
-		gaddrbytes := make([]byte, v.bi.Arch.PtrSize())
-		_, err := mem.ReadMemory(gaddrbytes, uintptr(gaddr))
+		var err error
+		gaddr, err = readUintRaw(mem, uintptr(gaddr), int64(v.bi.Arch.PtrSize()))
 		if err != nil {
 			return nil, fmt.Errorf("error derefing *G %s", err)
 		}
-		gaddr = binary.LittleEndian.Uint64(gaddrbytes)
 	}
 	if gaddr == 0 {
 		id := 0
@@ -522,9 +550,12 @@ func (v *Variable) parseG() (*G, error) {
 	schedVar := v.fieldVariable("sched")
 	pc, _ := constant.Int64Val(schedVar.fieldVariable("pc").Value)
 	sp, _ := constant.Int64Val(schedVar.fieldVariable("sp").Value)
-	var bp int64
+	var bp, lr int64
 	if bpvar := schedVar.fieldVariable("bp"); bpvar != nil && bpvar.Value != nil {
 		bp, _ = constant.Int64Val(bpvar.Value)
+	}
+	if bpvar := schedVar.fieldVariable("lr"); bpvar != nil && bpvar.Value != nil {
+		lr, _ = constant.Int64Val(bpvar.Value)
 	}
 	id, _ := constant.Int64Val(v.fieldVariable("goid").Value)
 	gopc, _ := constant.Int64Val(v.fieldVariable("gopc").Value)
@@ -558,6 +589,7 @@ func (v *Variable) parseG() (*G, error) {
 
 	status, _ := constant.Int64Val(v.fieldVariable("atomicstatus").Value)
 	f, l, fn := v.bi.PCToLine(uint64(pc))
+
 	g := &G{
 		ID:         int(id),
 		GoPC:       uint64(gopc),
@@ -565,6 +597,7 @@ func (v *Variable) parseG() (*G, error) {
 		PC:         uint64(pc),
 		SP:         uint64(sp),
 		BP:         uint64(bp),
+		LR:         uint64(lr),
 		WaitReason: waitReason,
 		Status:     uint64(status),
 		CurrentLoc: Location{PC: uint64(pc), File: f, Line: l, Fn: fn},
@@ -1027,26 +1060,23 @@ func readStringInfo(mem MemoryReadWriter, arch Arch, addr uintptr) (uintptr, int
 	mem = cacheMemory(mem, addr, arch.PtrSize()*2)
 
 	// read len
-	val := make([]byte, arch.PtrSize())
-	_, err := mem.ReadMemory(val, addr+uintptr(arch.PtrSize()))
+	strlen, err := readIntRaw(mem, addr+uintptr(arch.PtrSize()), int64(arch.PtrSize()))
 	if err != nil {
 		return 0, 0, fmt.Errorf("could not read string len %s", err)
 	}
-	strlen := int64(binary.LittleEndian.Uint64(val))
 	if strlen < 0 {
 		return 0, 0, fmt.Errorf("invalid length: %d", strlen)
 	}
 
 	// read addr
-	_, err = mem.ReadMemory(val, addr)
+	val, err := readUintRaw(mem, addr, int64(arch.PtrSize()))
 	if err != nil {
 		return 0, 0, fmt.Errorf("could not read string pointer %s", err)
 	}
-	addr = uintptr(binary.LittleEndian.Uint64(val))
+	addr = uintptr(val)
 	if addr == 0 {
 		return 0, 0, nil
 	}
-
 	return addr, strlen, nil
 }
 
@@ -1160,17 +1190,7 @@ func (v *Variable) loadChanInfo() {
 		field := &godwarf.StructField{}
 		*field = *structType.Field[i]
 		if field.Name == "buf" {
-			stride := chanType.ElemType.Common().ByteSize
-			atyp := &godwarf.ArrayType{
-				CommonType: godwarf.CommonType{
-					ReflectKind: reflect.Array,
-					ByteSize:    int64(chanLen) * stride,
-					Name:        fmt.Sprintf("[%d]%s", chanLen, chanType.ElemType.String())},
-				Type:          chanType.ElemType,
-				StrideBitSize: stride * 8,
-				Count:         int64(chanLen)}
-
-			field.Type = pointerTo(atyp, v.bi.Arch)
+			field.Type = pointerTo(fakeArrayType(chanLen, chanType.ElemType), v.bi.Arch)
 		}
 		newStructType.Field[i] = field
 	}
@@ -1433,14 +1453,13 @@ func (v *Variable) readFunctionPtr() {
 		return
 	}
 
-	val := make([]byte, v.bi.Arch.PtrSize())
-	_, err := v.mem.ReadMemory(val, uintptr(v.closureAddr))
+	val, err := readUintRaw(v.mem, uintptr(v.closureAddr), int64(v.bi.Arch.PtrSize()))
 	if err != nil {
 		v.Unreadable = err
 		return
 	}
 
-	v.Base = uintptr(binary.LittleEndian.Uint64(val))
+	v.Base = uintptr(val)
 	fn := v.bi.PCToFunc(uint64(v.Base))
 	if fn == nil {
 		v.Unreadable = fmt.Errorf("could not find function for %#v", v.Base)

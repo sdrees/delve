@@ -59,7 +59,7 @@ func assertVariable(t *testing.T, variable *proc.Variable, expected varTest) {
 	}
 }
 
-func findFirstNonRuntimeFrame(p proc.Process) (proc.Stackframe, error) {
+func findFirstNonRuntimeFrame(p *proc.Target) (proc.Stackframe, error) {
 	frames, err := proc.ThreadStacktrace(p.CurrentThread(), 10)
 	if err != nil {
 		return proc.Stackframe{}, err
@@ -73,7 +73,7 @@ func findFirstNonRuntimeFrame(p proc.Process) (proc.Stackframe, error) {
 	return proc.Stackframe{}, fmt.Errorf("non-runtime frame not found")
 }
 
-func evalScope(p proc.Process) (*proc.EvalScope, error) {
+func evalScope(p *proc.Target) (*proc.EvalScope, error) {
 	if testBackend != "rr" {
 		return proc.GoroutineScope(p.CurrentThread())
 	}
@@ -84,7 +84,7 @@ func evalScope(p proc.Process) (*proc.EvalScope, error) {
 	return proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frame), nil
 }
 
-func evalVariable(p proc.Process, symbol string, cfg proc.LoadConfig) (*proc.Variable, error) {
+func evalVariable(p *proc.Target, symbol string, cfg proc.LoadConfig) (*proc.Variable, error) {
 	scope, err := evalScope(p)
 	if err != nil {
 		return nil, err
@@ -99,7 +99,7 @@ func (tc *varTest) alternateVarTest() varTest {
 	return r
 }
 
-func setVariable(p proc.Process, symbol, value string) error {
+func setVariable(p *proc.Target, symbol, value string) error {
 	scope, err := proc.GoroutineScope(p.CurrentThread())
 	if err != nil {
 		return err
@@ -107,16 +107,16 @@ func setVariable(p proc.Process, symbol, value string) error {
 	return scope.SetVariable(symbol, value)
 }
 
-func withTestProcess(name string, t *testing.T, fn func(p proc.Process, fixture protest.Fixture)) {
+func withTestProcess(name string, t *testing.T, fn func(p *proc.Target, fixture protest.Fixture)) {
 	withTestProcessArgs(name, t, ".", []string{}, 0, fn)
 }
 
-func withTestProcessArgs(name string, t *testing.T, wd string, args []string, buildFlags protest.BuildFlags, fn func(p proc.Process, fixture protest.Fixture)) {
+func withTestProcessArgs(name string, t *testing.T, wd string, args []string, buildFlags protest.BuildFlags, fn func(p *proc.Target, fixture protest.Fixture)) {
 	if buildMode == "pie" {
 		buildFlags |= protest.BuildModePIE
 	}
 	fixture := protest.BuildFixture(name, buildFlags)
-	var p proc.Process
+	var p *proc.Target
 	var err error
 	var tracedir string
 	switch testBackend {
@@ -189,7 +189,7 @@ func TestVariableEvaluation(t *testing.T) {
 	}
 
 	protest.AllowRecording(t)
-	withTestProcess("testvariables", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables", t, func(p *proc.Target, fixture protest.Fixture) {
 		err := proc.Continue(p)
 		assertNoError(err, t, "Continue() returned an error")
 
@@ -233,7 +233,7 @@ func TestSetVariable(t *testing.T) {
 		{"b.ptr", "*main.A", "*main.A {val: 1337}", "nil", "*main.A nil"},
 		{"m2", "map[int]*main.astruct", "map[int]*main.astruct [1: *{A: 10, B: 11}, ]", "nil", "map[int]*main.astruct nil"},
 		{"fn1", "main.functype", "main.afunc", "nil", "nil"},
-		{"ch1", "chan int", "chan int 4/10", "nil", "chan int nil"},
+		{"ch1", "chan int", "chan int 4/11", "nil", "chan int nil"},
 		{"s2", "[]main.astruct", "[]main.astruct len: 8, cap: 8, [{A: 1, B: 2},{A: 3, B: 4},{A: 5, B: 6},{A: 7, B: 8},{A: 9, B: 10},{A: 11, B: 12},{A: 13, B: 14},{A: 15, B: 16}]", "nil", "[]main.astruct len: 0, cap: 0, nil"},
 		{"err1", "error", "error(*main.astruct) *{A: 1, B: 2}", "nil", "error nil"},
 		{"s1[0]", "string", `"one"`, `""`, `""`},
@@ -247,7 +247,7 @@ func TestSetVariable(t *testing.T) {
 		{"s3", "[]int", "[]int len: 3, cap: 3, [3,4,5]", "arr1[:]", "[]int len: 4, cap: 4, [0,1,2,3]"},
 	}
 
-	withTestProcess("testvariables2", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables2", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue()")
 
 		for _, tc := range testcases {
@@ -316,7 +316,7 @@ func TestVariableEvaluationShort(t *testing.T) {
 	}
 
 	protest.AllowRecording(t)
-	withTestProcess("testvariables", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables", t, func(p *proc.Target, fixture protest.Fixture) {
 		err := proc.Continue(p)
 		assertNoError(err, t, "Continue() returned an error")
 
@@ -372,7 +372,7 @@ func TestMultilineVariableEvaluation(t *testing.T) {
 	}
 
 	protest.AllowRecording(t)
-	withTestProcess("testvariables", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables", t, func(p *proc.Target, fixture protest.Fixture) {
 		err := proc.Continue(p)
 		assertNoError(err, t, "Continue() returned an error")
 
@@ -446,7 +446,7 @@ func TestLocalVariables(t *testing.T) {
 	}
 
 	protest.AllowRecording(t)
-	withTestProcess("testvariables", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables", t, func(p *proc.Target, fixture protest.Fixture) {
 		err := proc.Continue(p)
 		assertNoError(err, t, "Continue() returned an error")
 
@@ -483,7 +483,7 @@ func TestLocalVariables(t *testing.T) {
 
 func TestEmbeddedStruct(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestProcess("testvariables2", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables2", t, func(p *proc.Target, fixture protest.Fixture) {
 		testcases := []varTest{
 			{"b.val", true, "-314", "-314", "int", nil},
 			{"b.A.val", true, "-314", "-314", "int", nil},
@@ -524,7 +524,7 @@ func TestEmbeddedStruct(t *testing.T) {
 }
 
 func TestComplexSetting(t *testing.T) {
-	withTestProcess("testvariables", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables", t, func(p *proc.Target, fixture protest.Fixture) {
 		err := proc.Continue(p)
 		assertNoError(err, t, "Continue() returned an error")
 
@@ -587,7 +587,7 @@ func TestEvalExpression(t *testing.T) {
 		{"*p3", false, "", "", "int", fmt.Errorf("nil pointer dereference")},
 
 		// channels
-		{"ch1", true, "chan int 4/10", "chan int 4/10", "chan int", nil},
+		{"ch1", true, "chan int 4/11", "chan int 4/11", "chan int", nil},
 		{"chnil", true, "chan int nil", "chan int nil", "chan int", nil},
 		{"ch1+1", false, "", "", "", fmt.Errorf("can not convert 1 constant to chan int")},
 
@@ -682,7 +682,7 @@ func TestEvalExpression(t *testing.T) {
 		{"len(s3)", false, "0", "0", "", nil},
 		{"cap(nilslice)", false, "0", "0", "", nil},
 		{"len(nilslice)", false, "0", "0", "", nil},
-		{"cap(ch1)", false, "10", "10", "", nil},
+		{"cap(ch1)", false, "11", "11", "", nil},
 		{"len(ch1)", false, "4", "4", "", nil},
 		{"cap(chnil)", false, "0", "0", "", nil},
 		{"len(chnil)", false, "0", "0", "", nil},
@@ -790,8 +790,8 @@ func TestEvalExpression(t *testing.T) {
 
 		// access to channel field members
 		{"ch1.qcount", false, "4", "4", "uint", nil},
-		{"ch1.dataqsiz", false, "10", "10", "uint", nil},
-		{"ch1.buf", false, `*[10]int [1,4,3,2,0,0,0,0,0,0]`, `(*[10]int)(…`, "*[10]int", nil},
+		{"ch1.dataqsiz", false, "11", "11", "uint", nil},
+		{"ch1.buf", false, `*[11]int [1,4,3,2,0,0,0,0,0,0,0]`, `(*[11]int)(…`, "*[11]int", nil},
 		{"ch1.buf[0]", false, "1", "1", "int", nil},
 
 		// shortcircuited logical operators
@@ -822,7 +822,7 @@ func TestEvalExpression(t *testing.T) {
 	}
 
 	protest.AllowRecording(t)
-	withTestProcess("testvariables2", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables2", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue() returned an error")
 		for _, tc := range testcases {
 			variable, err := evalVariable(p, tc.name, pnormalLoadConfig)
@@ -851,7 +851,7 @@ func TestEvalExpression(t *testing.T) {
 
 func TestEvalAddrAndCast(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestProcess("testvariables2", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables2", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue() returned an error")
 		c1addr, err := evalVariable(p, "&c1", pnormalLoadConfig)
 		assertNoError(err, t, "EvalExpression(&c1)")
@@ -878,7 +878,7 @@ func TestEvalAddrAndCast(t *testing.T) {
 
 func TestMapEvaluation(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestProcess("testvariables2", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables2", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue() returned an error")
 		m1v, err := evalVariable(p, "m1", pnormalLoadConfig)
 		assertNoError(err, t, "EvalVariable()")
@@ -920,7 +920,7 @@ func TestMapEvaluation(t *testing.T) {
 
 func TestUnsafePointer(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestProcess("testvariables2", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables2", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue() returned an error")
 		up1v, err := evalVariable(p, "up1", pnormalLoadConfig)
 		assertNoError(err, t, "EvalVariable(up1)")
@@ -958,7 +958,7 @@ func TestIssue426(t *testing.T) {
 	// Serialization of type expressions (go/ast.Expr) containing anonymous structs or interfaces
 	// differs from the serialization used by the linker to produce DWARF type information
 	protest.AllowRecording(t)
-	withTestProcess("testvariables2", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("testvariables2", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue() returned an error")
 		for _, testcase := range testcases {
 			v, err := evalVariable(p, testcase.name, pnormalLoadConfig)
@@ -969,6 +969,23 @@ func TestIssue426(t *testing.T) {
 			assertNoError(err, t, fmt.Sprintf("EvalVariable(%s)", expr))
 		}
 	})
+}
+
+func testPackageRenamesHelper(t *testing.T, p *proc.Target, testcases []varTest) {
+	for _, tc := range testcases {
+		variable, err := evalVariable(p, tc.name, pnormalLoadConfig)
+		if tc.err == nil {
+			assertNoError(err, t, fmt.Sprintf("EvalExpression(%s) returned an error", tc.name))
+			assertVariable(t, variable, tc)
+		} else {
+			if err == nil {
+				t.Fatalf("Expected error %s, got no error (%s)", tc.err.Error(), tc.name)
+			}
+			if tc.err.Error() != err.Error() {
+				t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
+			}
+		}
+	}
 }
 
 func TestPackageRenames(t *testing.T) {
@@ -999,41 +1016,43 @@ func TestPackageRenames(t *testing.T) {
 		{"aslice", true, `interface {}([]github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType) [{X: 3},{X: 4}]`, "", "interface {}", nil},
 		{"afunc", true, `interface {}(func(github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType, github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType)) main.main.func1`, "", "interface {}", nil},
 		{"astruct", true, `interface {}(*struct { A github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType; B github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType }) *{A: github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType {X: 1, Y: 2}, B: github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType {X: 3}}`, "", "interface {}", nil},
-		{"astruct2", true, `interface {}(*struct { github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType; X int }) *{SomeType: github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType {X: 1, Y: 2}, X: 10}`, "", "interface {}", nil},
 		{"iface2iface", true, `interface {}(*interface { AMethod(int) int; AnotherMethod(int) int }) **github.com/go-delve/delve/_fixtures/internal/dir0/pkg.SomeType {X: 4}`, "", "interface {}", nil},
 
 		{`"dir0/pkg".A`, false, "0", "", "int", nil},
 		{`"dir1/pkg".A`, false, "1", "", "int", nil},
 	}
 
-	ver, _ := goversion.Parse(runtime.Version())
-	if ver.Major > 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 7, -1, 0, 0, ""}) {
-		// Not supported on 1.6 or earlier
+	testcases1_8 := []varTest{
+		// before 1.9 embedded struct fields have fieldname == type
+		{"astruct2", true, `interface {}(*struct { github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType; X int }) *{github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType: github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType {X: 1, Y: 2}, X: 10}`, "", "interface {}", nil},
+	}
+
+	testcases1_9 := []varTest{
+		{"astruct2", true, `interface {}(*struct { github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType; X int }) *{SomeType: github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType {X: 1, Y: 2}, X: 10}`, "", "interface {}", nil},
+	}
+
+	testcases1_13 := []varTest{
+		// needs DW_AT_go_package_name attribute added to Go1.13
+		{`dirio.A`, false, `"something"`, "", "string", nil},
+	}
+
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 7) {
 		return
 	}
 
 	protest.AllowRecording(t)
-	withTestProcess("pkgrenames", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("pkgrenames", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue() returned an error")
-		for _, tc := range testcases {
-			if ver.Major > 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 9, -1, 0, 0, ""}) {
-				// before 1.9 embedded struct field have fieldname == type
-				if tc.name == "astruct2" {
-					tc.value = `interface {}(*struct { github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType; X int }) *{github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType: github.com/go-delve/delve/_fixtures/internal/dir1/pkg.SomeType {X: 1, Y: 2}, X: 10}`
-				}
-			}
-			variable, err := evalVariable(p, tc.name, pnormalLoadConfig)
-			if tc.err == nil {
-				assertNoError(err, t, fmt.Sprintf("EvalExpression(%s) returned an error", tc.name))
-				assertVariable(t, variable, tc)
-			} else {
-				if err == nil {
-					t.Fatalf("Expected error %s, got no error (%s)", tc.err.Error(), tc.name)
-				}
-				if tc.err.Error() != err.Error() {
-					t.Fatalf("Unexpected error. Expected %s got %s", tc.err.Error(), err.Error())
-				}
-			}
+		testPackageRenamesHelper(t, p, testcases)
+
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 9) {
+			testPackageRenamesHelper(t, p, testcases1_9)
+		} else {
+			testPackageRenamesHelper(t, p, testcases1_8)
+		}
+
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 13) {
+			testPackageRenamesHelper(t, p, testcases1_13)
 		}
 	})
 }
@@ -1049,14 +1068,14 @@ func TestConstants(t *testing.T) {
 		{"bitZero", true, "1", "", "main.BitFieldType", nil},
 		{"bitOne", true, "2", "", "main.BitFieldType", nil},
 		{"constTwo", true, "2", "", "main.ConstType", nil},
-		{"pkg.SomeConst", true, "2", "", "int", nil},
+		{"pkg.SomeConst", false, "2", "", "int", nil},
 	}
 	ver, _ := goversion.Parse(runtime.Version())
 	if ver.Major > 0 && !ver.AfterOrEqual(goversion.GoVersion{1, 10, -1, 0, 0, ""}) {
 		// Not supported on 1.9 or earlier
 		t.Skip("constants added in go 1.10")
 	}
-	withTestProcess("consts", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("consts", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue")
 		for _, testcase := range testcases {
 			variable, err := evalVariable(p, testcase.name, pnormalLoadConfig)
@@ -1066,15 +1085,18 @@ func TestConstants(t *testing.T) {
 	})
 }
 
-func setFunctionBreakpoint(p proc.Process, t testing.TB, fname string) *proc.Breakpoint {
+func setFunctionBreakpoint(p *proc.Target, t testing.TB, fname string) *proc.Breakpoint {
 	_, f, l, _ := runtime.Caller(1)
 	f = filepath.Base(f)
 
-	addr, err := proc.FindFunctionLocation(p, fname, 0)
+	addrs, err := proc.FindFunctionLocation(p, fname, 0)
 	if err != nil {
 		t.Fatalf("%s:%d: FindFunctionLocation(%s): %v", f, l, fname, err)
 	}
-	bp, err := p.SetBreakpoint(addr, proc.UserBreakpoint, nil)
+	if len(addrs) != 1 {
+		t.Fatalf("%s:%d: setFunctionBreakpoint(%s): too many results %v", f, l, fname, addrs)
+	}
+	bp, err := p.SetBreakpoint(addrs[0], proc.UserBreakpoint, nil)
 	if err != nil {
 		t.Fatalf("%s:%d: FindFunctionLocation(%s): %v", f, l, fname, err)
 	}
@@ -1082,7 +1104,7 @@ func setFunctionBreakpoint(p proc.Process, t testing.TB, fname string) *proc.Bre
 }
 
 func TestIssue1075(t *testing.T) {
-	withTestProcess("clientdo", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("clientdo", t, func(p *proc.Target, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "net/http.(*Client).Do")
 		assertNoError(proc.Continue(p), t, "Continue()")
 		for i := 0; i < 10; i++ {
@@ -1104,6 +1126,9 @@ type testCaseCallFunction struct {
 }
 
 func TestCallFunction(t *testing.T) {
+	if runtime.GOARCH == "arm64" {
+		t.Skip("arm64 does not support CallFunction for now")
+	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 
 	var testcases = []testCaseCallFunction{
@@ -1180,13 +1205,12 @@ func TestCallFunction(t *testing.T) {
 		// support calling optimized functions
 		{`strings.Join(nil, "")`, []string{`:string:""`}, nil},
 		{`strings.Join(stringslice, comma)`, []string{`:string:"one,two,three"`}, nil},
-		{`strings.Join(s1, comma)`, nil, errors.New(`error evaluating "s1" as argument a in function strings.Join: could not find symbol value for s1`)},
 		{`strings.Join(intslice, comma)`, nil, errors.New("can not convert value of type []int to []string")},
 		{`strings.Join(stringslice, ",")`, []string{`:string:"one,two,three"`}, nil},
 		{`strings.LastIndexByte(stringslice[1], 'w')`, []string{":int:1"}, nil},
 		{`strings.LastIndexByte(stringslice[1], 'o')`, []string{":int:2"}, nil},
-		{`d.Base.Method()`, []string{ `:int:4` }, nil },
-		{`d.Method()`, []string{ `:int:4` }, nil },
+		{`d.Base.Method()`, []string{`:int:4`}, nil},
+		{`d.Method()`, []string{`:int:4`}, nil},
 	}
 
 	var testcases113 = []testCaseCallFunction{
@@ -1205,7 +1229,15 @@ func TestCallFunction(t *testing.T) {
 		{`getVRcvrableFromAStructPtr(6).VRcvr(5)`, []string{`:string:"5 + 6 = 11"`}, nil}, // indirect call of method on interface / containing pointer with pointer method
 	}
 
-	withTestProcess("fncall", t, func(p proc.Process, fixture protest.Fixture) {
+	var testcasesBefore114After112 = []testCaseCallFunction{
+		{`strings.Join(s1, comma)`, nil, errors.New(`error evaluating "s1" as argument a in function strings.Join: could not find symbol value for s1`)},
+	}
+
+	var testcases114 = []testCaseCallFunction{
+		{`strings.Join(s1, comma)`, nil, errors.New(`error evaluating "s1" as argument elems in function strings.Join: could not find symbol value for s1`)},
+	}
+
+	withTestProcess("fncall", t, func(p *proc.Target, fixture protest.Fixture) {
 		_, err := proc.FindFunctionLocation(p, "runtime.debugCallV1", 0)
 		if err != nil {
 			t.Skip("function calls not supported on this version of go")
@@ -1219,10 +1251,21 @@ func TestCallFunction(t *testing.T) {
 			for _, tc := range testcases112 {
 				testCallFunction(t, p, tc)
 			}
+			if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
+				for _, tc := range testcasesBefore114After112 {
+					testCallFunction(t, p, tc)
+				}
+			}
 		}
 
 		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 13) {
 			for _, tc := range testcases113 {
+				testCallFunction(t, p, tc)
+			}
+		}
+
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
+			for _, tc := range testcases114 {
 				testCallFunction(t, p, tc)
 			}
 		}
@@ -1232,7 +1275,7 @@ func TestCallFunction(t *testing.T) {
 	})
 }
 
-func testCallFunction(t *testing.T, p proc.Process, tc testCaseCallFunction) {
+func testCallFunction(t *testing.T, p *proc.Target, tc testCaseCallFunction) {
 	const unsafePrefix = "-unsafe "
 
 	var callExpr, varExpr string
@@ -1308,7 +1351,7 @@ func testCallFunction(t *testing.T, p proc.Process, tc testCaseCallFunction) {
 
 func TestIssue1531(t *testing.T) {
 	// Go 1.12 introduced a change to the map representation where empty cells can be marked with 1 instead of just 0.
-	withTestProcess("issue1531", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("issue1531", t, func(p *proc.Target, fixture protest.Fixture) {
 		assertNoError(proc.Continue(p), t, "Continue()")
 
 		hasKeys := func(mv *proc.Variable, keys ...string) {
@@ -1348,22 +1391,25 @@ func TestIssue1531(t *testing.T) {
 	})
 }
 
-func setFileBreakpoint(p proc.Process, t *testing.T, fixture protest.Fixture, lineno int) *proc.Breakpoint {
+func setFileBreakpoint(p *proc.Target, t *testing.T, fixture protest.Fixture, lineno int) *proc.Breakpoint {
 	_, f, l, _ := runtime.Caller(1)
 	f = filepath.Base(f)
 
-	addr, err := proc.FindFileLocation(p, fixture.Source, lineno)
+	addrs, err := proc.FindFileLocation(p, fixture.Source, lineno)
 	if err != nil {
 		t.Fatalf("%s:%d: FindFileLocation(%s, %d): %v", f, l, fixture.Source, lineno, err)
 	}
-	bp, err := p.SetBreakpoint(addr, proc.UserBreakpoint, nil)
+	if len(addrs) != 1 {
+		t.Fatalf("%s:%d: setFileLineBreakpoint(%s, %d): too many results %v", f, l, fixture.Source, lineno, addrs)
+	}
+	bp, err := p.SetBreakpoint(addrs[0], proc.UserBreakpoint, nil)
 	if err != nil {
 		t.Fatalf("%s:%d: SetBreakpoint: %v", f, l, err)
 	}
 	return bp
 }
 
-func currentLocation(p proc.Process, t *testing.T) (pc uint64, f string, ln int, fn *proc.Function) {
+func currentLocation(p *proc.Target, t *testing.T) (pc uint64, f string, ln int, fn *proc.Function) {
 	regs, err := p.CurrentThread().Registers(false)
 	if err != nil {
 		t.Fatalf("Registers error: %v", err)
@@ -1373,7 +1419,7 @@ func currentLocation(p proc.Process, t *testing.T) (pc uint64, f string, ln int,
 	return regs.PC(), f, l, fn
 }
 
-func assertCurrentLocationFunction(p proc.Process, t *testing.T, fnname string) {
+func assertCurrentLocationFunction(p *proc.Target, t *testing.T, fnname string) {
 	_, _, _, fn := currentLocation(p, t)
 	if fn == nil {
 		t.Fatalf("Not in a function")
@@ -1386,7 +1432,7 @@ func assertCurrentLocationFunction(p proc.Process, t *testing.T, fnname string) 
 func TestPluginVariables(t *testing.T) {
 	pluginFixtures := protest.WithPlugins(t, protest.AllNonOptimized, "plugin1/", "plugin2/")
 
-	withTestProcessArgs("plugintest2", t, ".", []string{pluginFixtures[0].Path, pluginFixtures[1].Path}, protest.AllNonOptimized, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcessArgs("plugintest2", t, ".", []string{pluginFixtures[0].Path, pluginFixtures[1].Path}, protest.AllNonOptimized, func(p *proc.Target, fixture protest.Fixture) {
 		setFileBreakpoint(p, t, fixture, 41)
 		assertNoError(proc.Continue(p), t, "Continue 1")
 

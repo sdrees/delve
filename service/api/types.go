@@ -39,15 +39,17 @@ type DebuggerState struct {
 	Err error `json:"-"`
 }
 
-// Breakpoint addresses a location at which process execution may be
+// Breakpoint addresses a set of locations at which process execution may be
 // suspended.
 type Breakpoint struct {
 	// ID is a unique identifier for the breakpoint.
 	ID int `json:"id"`
-	// User defined name of the breakpoint
+	// User defined name of the breakpoint.
 	Name string `json:"name"`
-	// Addr is the address of the breakpoint.
+	// Addr is deprecated, use Addrs.
 	Addr uint64 `json:"addr"`
+	// Addrs is the list of addresses for this breakpoint.
+	Addrs []uint64 `json:"addrs"`
 	// File is the source file for the breakpoint.
 	File string `json:"file"`
 	// Line is a line in File for the breakpoint.
@@ -124,11 +126,16 @@ type Thread struct {
 }
 
 // Location holds program location information.
+// In most cases a Location object will represent a physical location, with
+// a single PC address held in the PC field.
+// FindLocations however returns logical locations that can either have
+// multiple PC addresses each (due to inlining) or no PC address at all.
 type Location struct {
 	PC       uint64    `json:"pc"`
 	File     string    `json:"file"`
 	Line     int       `json:"line"`
 	Function *Function `json:"function,omitempty"`
+	PCs      []uint64  `json:"pcs,omitempty"`
 }
 
 // Stackframe describes one frame in a stack trace.
@@ -301,6 +308,8 @@ type Goroutine struct {
 	// ID of the associated thread for running goroutines
 	ThreadID   int    `json:"threadID"`
 	Unreadable string `json:"unreadable"`
+	// Goroutine's pprof labels
+	Labels map[string]string `json:"labels,omitempty"`
 }
 
 // DebuggerCommand is a command which changes the debugger's execution state.
@@ -502,3 +511,10 @@ const (
 	// values saved in the runtime.g structure.
 	StacktraceG
 )
+
+// ImportPathToDirectoryPath maps an import path to a directory path.
+type PackageBuildInfo struct {
+	ImportPath    string
+	DirectoryPath string
+	Files         []string
+}

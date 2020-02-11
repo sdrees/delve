@@ -48,7 +48,7 @@ type OSProcessDetails struct {
 // to be supplied to that process. `wd` is working directory of the program.
 // If the DWARF information cannot be found in the binary, Delve will look
 // for external debug files in the directories passed in.
-func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string) (*Process, error) {
+func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string) (*proc.Target, error) {
 	var (
 		process *exec.Cmd
 		err     error
@@ -65,7 +65,6 @@ func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string) (*
 	}
 
 	dbp := New(0)
-	dbp.common = proc.NewCommonProcess(true)
 	dbp.execPtraceFunc(func() {
 		process = exec.Command(cmd[0])
 		process.Args = cmd
@@ -93,15 +92,14 @@ func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string) (*
 	if err = dbp.initialize(cmd[0], debugInfoDirs); err != nil {
 		return nil, err
 	}
-	return dbp, nil
+	return proc.NewTarget(dbp, false), nil
 }
 
 // Attach to an existing process with the given PID. Once attached, if
 // the DWARF information cannot be found in the binary, Delve will look
 // for external debug files in the directories passed in.
-func Attach(pid int, debugInfoDirs []string) (*Process, error) {
+func Attach(pid int, debugInfoDirs []string) (*proc.Target, error) {
 	dbp := New(pid)
-	dbp.common = proc.NewCommonProcess(true)
 
 	var err error
 	dbp.execPtraceFunc(func() { err = PtraceAttach(dbp.pid) })
@@ -118,7 +116,14 @@ func Attach(pid int, debugInfoDirs []string) (*Process, error) {
 		dbp.Detach(false)
 		return nil, err
 	}
-	return dbp, nil
+
+	// ElfUpdateSharedObjects can only be done after we initialize because it
+	// needs an initialized BinaryInfo object to work.
+	err = linutil.ElfUpdateSharedObjects(dbp)
+	if err != nil {
+		return nil, err
+	}
+	return proc.NewTarget(dbp, false), nil
 }
 
 func initialize(dbp *Process) error {
@@ -319,12 +324,23 @@ func (dbp *Process) trapWaitInternal(pid int, halt bool) (*Thread, error) {
 		}
 
 		// TODO(dp) alert user about unexpected signals here.
-		if err := th.resumeWithSig(int(status.StopSignal())); err != nil {
-			if err == sys.ESRCH {
-				dbp.postExit()
-				return nil, proc.ErrProcessExited{Pid: dbp.pid}
+		if halt && !th.os.running {
+			// We are trying to stop the process, queue this signal to be delivered
+			// to the thread when we resume.
+			// Do not do this for threads that were running because we sent them a
+			// STOP signal and we need to observe it so we don't mistakenly deliver
+			// it later.
+			th.os.delayedSignal = int(status.StopSignal())
+			th.os.running = false
+			return th, nil
+		} else {
+			if err := th.resumeWithSig(int(status.StopSignal())); err != nil {
+				if err == sys.ESRCH {
+					dbp.postExit()
+					return nil, proc.ErrProcessExited{Pid: dbp.pid}
+				}
+				return nil, err
 			}
-			return nil, err
 		}
 	}
 }
@@ -429,6 +445,9 @@ func (dbp *Process) stop(trapthread *Thread) (err error) {
 			if err := th.stop(); err != nil {
 				return dbp.exitGuard(err)
 			}
+		} else {
+			// Thread is already in a trace stop but we didn't get the notification yet.
+			th.os.running = false
 		}
 	}
 

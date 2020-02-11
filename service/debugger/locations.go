@@ -216,7 +216,7 @@ func stripReceiverDecoration(in string) string {
 	return in[2 : len(in)-1]
 }
 
-func (spec *FuncLocationSpec) Match(sym proc.Function) bool {
+func (spec *FuncLocationSpec) Match(sym proc.Function, packageMap map[string][]string) bool {
 	if spec.BaseName != sym.BaseName() {
 		return false
 	}
@@ -231,15 +231,24 @@ func (spec *FuncLocationSpec) Match(sym proc.Function) bool {
 				return false
 			}
 		} else {
-			if !partialPathMatch(spec.PackageName, sym.PackageName()) {
+			if !packageMatch(spec.PackageName, sym.PackageName(), packageMap) {
 				return false
 			}
 		}
 	}
-	if spec.PackageOrReceiverName != "" && !partialPathMatch(spec.PackageOrReceiverName, sym.PackageName()) && spec.PackageOrReceiverName != recv {
+	if spec.PackageOrReceiverName != "" && !packageMatch(spec.PackageOrReceiverName, sym.PackageName(), packageMap) && spec.PackageOrReceiverName != recv {
 		return false
 	}
 	return true
+}
+
+func packageMatch(specPkg, symPkg string, packageMap map[string][]string) bool {
+	for _, pkg := range packageMap[specPkg] {
+		if partialPackageMatch(pkg, symPkg) {
+			return true
+		}
+	}
+	return partialPackageMatch(specPkg, symPkg)
 }
 
 func (loc *RegexLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool) ([]api.Location, error) {
@@ -250,9 +259,9 @@ func (loc *RegexLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr st
 	}
 	r := make([]api.Location, 0, len(matches))
 	for i := range matches {
-		addr, err := proc.FindFunctionLocation(d.target, matches[i], 0)
-		if err == nil {
-			r = append(r, api.Location{PC: addr})
+		addrs, _ := proc.FindFunctionLocation(d.target, matches[i], 0)
+		if len(addrs) > 0 {
+			r = append(r, addressesToLocation(addrs))
 		}
 	}
 	return r, nil
@@ -283,7 +292,7 @@ func (loc *AddrLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr str
 			if err != nil {
 				return nil, err
 			}
-			return []api.Location{{PC: uint64(pc)}}, nil
+			return []api.Location{{PC: pc}}, nil
 		default:
 			return nil, fmt.Errorf("wrong expression kind: %v", v.Kind)
 		}
@@ -304,6 +313,10 @@ func partialPathMatch(expr, path string) bool {
 		expr = strings.ToLower(filepath.ToSlash(expr))
 		path = strings.ToLower(filepath.ToSlash(path))
 	}
+	return partialPackageMatch(expr, path)
+}
+
+func partialPackageMatch(expr, path string) bool {
 	if len(expr) < len(path)-1 {
 		return strings.HasSuffix(path, expr) && (path[len(path)-len(expr)-1] == '/')
 	} else {
@@ -347,7 +360,7 @@ func (loc *NormalLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr s
 	var candidateFuncs []string
 	if loc.FuncBase != nil {
 		for _, f := range d.target.BinInfo().Functions {
-			if !loc.FuncBase.Match(f) {
+			if !loc.FuncBase.Match(f, d.target.BinInfo().PackageMap) {
 				continue
 			}
 			if loc.Base == f.Name {
@@ -377,26 +390,33 @@ func (loc *NormalLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr s
 	}
 
 	// len(candidateFiles) + len(candidateFuncs) == 1
-	var addr uint64
+	var addrs []uint64
 	var err error
 	if len(candidateFiles) == 1 {
 		if loc.LineOffset < 0 {
 			return nil, fmt.Errorf("Malformed breakpoint location, no line offset specified")
 		}
-		addr, err = proc.FindFileLocation(d.target, candidateFiles[0], loc.LineOffset)
+		addrs, err = proc.FindFileLocation(d.target, candidateFiles[0], loc.LineOffset)
 		if includeNonExecutableLines {
 			if _, isCouldNotFindLine := err.(*proc.ErrCouldNotFindLine); isCouldNotFindLine {
 				return []api.Location{{File: candidateFiles[0], Line: loc.LineOffset}}, nil
 			}
 		}
-	} else { // len(candidateFUncs) == 1
-		addr, err = proc.FindFunctionLocation(d.target, candidateFuncs[0], loc.LineOffset)
+	} else { // len(candidateFuncs) == 1
+		addrs, err = proc.FindFunctionLocation(d.target, candidateFuncs[0], loc.LineOffset)
 	}
 
 	if err != nil {
 		return nil, err
 	}
-	return []api.Location{{PC: addr}}, nil
+	return []api.Location{addressesToLocation(addrs)}, nil
+}
+
+func addressesToLocation(addrs []uint64) api.Location {
+	if len(addrs) <= 0 {
+		return api.Location{}
+	}
+	return api.Location{PC: addrs[0], PCs: addrs}
 }
 
 func (loc *OffsetLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool) ([]api.Location, error) {
@@ -410,13 +430,13 @@ func (loc *OffsetLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr s
 	if fn == nil {
 		return nil, fmt.Errorf("could not determine current location")
 	}
-	addr, err := proc.FindFileLocation(d.target, file, line+loc.Offset)
+	addrs, err := proc.FindFileLocation(d.target, file, line+loc.Offset)
 	if includeNonExecutableLines {
 		if _, isCouldNotFindLine := err.(*proc.ErrCouldNotFindLine); isCouldNotFindLine {
 			return []api.Location{{File: file, Line: line + loc.Offset}}, nil
 		}
 	}
-	return []api.Location{{PC: addr}}, err
+	return []api.Location{addressesToLocation(addrs)}, err
 }
 
 func (loc *LineLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr string, includeNonExecutableLines bool) ([]api.Location, error) {
@@ -427,11 +447,11 @@ func (loc *LineLocationSpec) Find(d *Debugger, scope *proc.EvalScope, locStr str
 	if fn == nil {
 		return nil, fmt.Errorf("could not determine current location")
 	}
-	addr, err := proc.FindFileLocation(d.target, file, loc.Line)
+	addrs, err := proc.FindFileLocation(d.target, file, loc.Line)
 	if includeNonExecutableLines {
 		if _, isCouldNotFindLine := err.(*proc.ErrCouldNotFindLine); isCouldNotFindLine {
 			return []api.Location{{File: file, Line: loc.Line}}, nil
 		}
 	}
-	return []api.Location{{PC: addr}}, err
+	return []api.Location{addressesToLocation(addrs)}, err
 }

@@ -23,7 +23,7 @@ func TestMain(m *testing.M) {
 	os.Exit(protest.RunTestsWithFixtures(m))
 }
 
-func withTestRecording(name string, t testing.TB, fn func(p *gdbserial.Process, fixture protest.Fixture)) {
+func withTestRecording(name string, t testing.TB, fn func(t *proc.Target, fixture protest.Fixture)) {
 	fixture := protest.BuildFixture(name, 0)
 	protest.MustHaveRecordingAllowed(t)
 	if path, _ := exec.LookPath("rr"); path == "" {
@@ -36,9 +36,7 @@ func withTestRecording(name string, t testing.TB, fn func(p *gdbserial.Process, 
 	}
 	t.Logf("replaying %q", tracedir)
 
-	defer func() {
-		p.Detach(true)
-	}()
+	defer p.Detach(true)
 
 	fn(p, fixture)
 }
@@ -52,16 +50,26 @@ func assertNoError(err error, t testing.TB, s string) {
 }
 
 func setFunctionBreakpoint(p proc.Process, t *testing.T, fname string) *proc.Breakpoint {
-	addr, err := proc.FindFunctionLocation(p, fname, 0)
-	assertNoError(err, t, fmt.Sprintf("FindFunctionLocation(%s)", fname))
-	bp, err := p.SetBreakpoint(addr, proc.UserBreakpoint, nil)
-	assertNoError(err, t, fmt.Sprintf("SetBreakpoint(%#x) function %s", addr, fname))
+	_, f, l, _ := runtime.Caller(1)
+	f = filepath.Base(f)
+
+	addrs, err := proc.FindFunctionLocation(p, fname, 0)
+	if err != nil {
+		t.Fatalf("%s:%d: FindFunctionLocation(%s): %v", f, l, fname, err)
+	}
+	if len(addrs) != 1 {
+		t.Fatalf("%s:%d: setFunctionBreakpoint(%s): too many results %v", f, l, fname, addrs)
+	}
+	bp, err := p.SetBreakpoint(addrs[0], proc.UserBreakpoint, nil)
+	if err != nil {
+		t.Fatalf("%s:%d: FindFunctionLocation(%s): %v", f, l, fname, err)
+	}
 	return bp
 }
 
 func TestRestartAfterExit(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestRecording("testnextprog", t, func(p *gdbserial.Process, fixture protest.Fixture) {
+	withTestRecording("testnextprog", t, func(p *proc.Target, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(proc.Continue(p), t, "Continue")
 		loc, err := p.CurrentThread().Location()
@@ -88,7 +96,7 @@ func TestRestartAfterExit(t *testing.T) {
 
 func TestRestartDuringStop(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestRecording("testnextprog", t, func(p *gdbserial.Process, fixture protest.Fixture) {
+	withTestRecording("testnextprog", t, func(p *proc.Target, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(proc.Continue(p), t, "Continue")
 		loc, err := p.CurrentThread().Location()
@@ -109,18 +117,28 @@ func TestRestartDuringStop(t *testing.T) {
 	})
 }
 
-func setFileBreakpoint(p proc.Process, t *testing.T, file string, line int) *proc.Breakpoint {
-	addr, _, err := p.BinInfo().LineToPC(file, line)
-	assertNoError(err, t, "LineToPC")
-	bp, err := p.SetBreakpoint(addr, proc.UserBreakpoint, nil)
-	assertNoError(err, t, fmt.Sprintf("SetBreakpoint(%#x) - %s:%d", addr, file, line))
+func setFileBreakpoint(p proc.Process, t *testing.T, fixture protest.Fixture, lineno int) *proc.Breakpoint {
+	_, f, l, _ := runtime.Caller(1)
+	f = filepath.Base(f)
+
+	addrs, err := proc.FindFileLocation(p, fixture.Source, lineno)
+	if err != nil {
+		t.Fatalf("%s:%d: FindFileLocation(%s, %d): %v", f, l, fixture.Source, lineno, err)
+	}
+	if len(addrs) != 1 {
+		t.Fatalf("%s:%d: setFileLineBreakpoint(%s, %d): too many results %v", f, l, fixture.Source, lineno, addrs)
+	}
+	bp, err := p.SetBreakpoint(addrs[0], proc.UserBreakpoint, nil)
+	if err != nil {
+		t.Fatalf("%s:%d: SetBreakpoint: %v", f, l, err)
+	}
 	return bp
 }
 
 func TestReverseBreakpointCounts(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestRecording("bpcountstest", t, func(p *gdbserial.Process, fixture protest.Fixture) {
-		endbp := setFileBreakpoint(p, t, fixture.Source, 28)
+	withTestRecording("bpcountstest", t, func(p *proc.Target, fixture protest.Fixture) {
+		endbp := setFileBreakpoint(p, t, fixture, 28)
 		assertNoError(proc.Continue(p), t, "Continue()")
 		loc, _ := p.CurrentThread().Location()
 		if loc.PC != endbp.Addr {
@@ -129,8 +147,8 @@ func TestReverseBreakpointCounts(t *testing.T) {
 
 		p.ClearBreakpoint(endbp.Addr)
 		assertNoError(p.Direction(proc.Backward), t, "Switching to backward direction")
-		bp := setFileBreakpoint(p, t, fixture.Source, 12)
-		startbp := setFileBreakpoint(p, t, fixture.Source, 20)
+		bp := setFileBreakpoint(p, t, fixture, 12)
+		startbp := setFileBreakpoint(p, t, fixture, 20)
 
 	countLoop:
 		for {
@@ -163,7 +181,7 @@ func TestReverseBreakpointCounts(t *testing.T) {
 	})
 }
 
-func getPosition(p *gdbserial.Process, t *testing.T) (when string, loc *proc.Location) {
+func getPosition(p *proc.Target, t *testing.T) (when string, loc *proc.Location) {
 	var err error
 	when, err = p.When()
 	assertNoError(err, t, "When")
@@ -174,12 +192,12 @@ func getPosition(p *gdbserial.Process, t *testing.T) (when string, loc *proc.Loc
 
 func TestCheckpoints(t *testing.T) {
 	protest.AllowRecording(t)
-	withTestRecording("continuetestprog", t, func(p *gdbserial.Process, fixture protest.Fixture) {
+	withTestRecording("continuetestprog", t, func(p *proc.Target, fixture protest.Fixture) {
 		// Continues until start of main.main, record output of 'when'
 		bp := setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(proc.Continue(p), t, "Continue")
 		when0, loc0 := getPosition(p, t)
-		t.Logf("when0: %q (%#x)", when0, loc0.PC)
+		t.Logf("when0: %q (%#x) %x", when0, loc0.PC, p.CurrentThread().ThreadID())
 
 		// Create a checkpoint and check that the list of checkpoints reflects this
 		cpid, err := p.Checkpoint("checkpoint1")
@@ -197,7 +215,7 @@ func TestCheckpoints(t *testing.T) {
 		assertNoError(proc.Next(p), t, "First Next")
 		assertNoError(proc.Next(p), t, "Second Next")
 		when1, loc1 := getPosition(p, t)
-		t.Logf("when1: %q (%#x)", when1, loc1.PC)
+		t.Logf("when1: %q (%#x) %x", when1, loc1.PC, p.CurrentThread().ThreadID())
 		if loc0.PC == loc1.PC {
 			t.Fatalf("next did not move process %#x", loc0.PC)
 		}
@@ -208,8 +226,10 @@ func TestCheckpoints(t *testing.T) {
 		// Move back to checkpoint, check that the output of 'when' is the same as
 		// what it was when we set the breakpoint
 		p.Restart(fmt.Sprintf("c%d", cpid))
+		g, _ := proc.FindGoroutine(p, 1)
+		p.SwitchGoroutine(g)
 		when2, loc2 := getPosition(p, t)
-		t.Logf("when2: %q (%#x)", when2, loc2.PC)
+		t.Logf("when2: %q (%#x) %x", when2, loc2.PC, p.CurrentThread().ThreadID())
 		if loc2.PC != loc0.PC {
 			t.Fatalf("PC address mismatch %#x != %#x", loc0.PC, loc2.PC)
 		}
@@ -234,6 +254,8 @@ func TestCheckpoints(t *testing.T) {
 		_, err = p.ClearBreakpoint(bp.Addr)
 		assertNoError(err, t, "ClearBreakpoint")
 		p.Restart(fmt.Sprintf("c%d", cpid))
+		g, _ = proc.FindGoroutine(p, 1)
+		p.SwitchGoroutine(g)
 		assertNoError(proc.Next(p), t, "First Next")
 		assertNoError(proc.Next(p), t, "Second Next")
 		when4, loc4 := getPosition(p, t)
@@ -258,7 +280,7 @@ func TestCheckpoints(t *testing.T) {
 func TestIssue1376(t *testing.T) {
 	// Backward Continue should terminate when it encounters the start of the process.
 	protest.AllowRecording(t)
-	withTestRecording("continuetestprog", t, func(p *gdbserial.Process, fixture protest.Fixture) {
+	withTestRecording("continuetestprog", t, func(p *proc.Target, fixture protest.Fixture) {
 		bp := setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(proc.Continue(p), t, "Continue (forward)")
 		_, err := p.ClearBreakpoint(bp.Addr)

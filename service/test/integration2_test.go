@@ -364,8 +364,8 @@ func TestClientServer_breakpointInMainThread(t *testing.T) {
 		}
 
 		state := <-c.Continue()
-		if err != nil {
-			t.Fatalf("Unexpected error: %v, state: %#v", err, state)
+		if state.Err != nil {
+			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
 		}
 
 		pc := state.CurrentThread.PC
@@ -725,6 +725,13 @@ func TestClientServer_FindLocations(t *testing.T) {
 		}
 		c.ClearBreakpoint(bp.ID)
 	})
+
+	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 13) {
+		withTestClient2("pkgrenames", t, func(c service.Client) {
+			someFuncLoc := findLocationHelper(t, c, "github.com/go-delve/delve/_fixtures/internal/dir%2eio.SomeFunction:0", false, 1, 0)[0]
+			findLocationHelper(t, c, "dirio.SomeFunction:0", false, 1, someFuncLoc)
+		})
+	}
 }
 
 func TestClientServer_FindLocationsAddr(t *testing.T) {
@@ -975,7 +982,7 @@ func TestDisasm(t *testing.T) {
 		// look for static call to afunction() on line 29
 		found := false
 		for i := range d3 {
-			if d3[i].Loc.Line == 29 && strings.HasPrefix(d3[i].Text, "call") && d3[i].DestLoc != nil && d3[i].DestLoc.Function != nil && d3[i].DestLoc.Function.Name() == "main.afunction" {
+			if d3[i].Loc.Line == 29 && (strings.HasPrefix(d3[i].Text, "call") || strings.HasPrefix(d3[i].Text, "CALL")) && d3[i].DestLoc != nil && d3[i].DestLoc.Function != nil && d3[i].DestLoc.Function.Name() == "main.afunction" {
 				found = true
 				break
 			}
@@ -1020,7 +1027,7 @@ func TestDisasm(t *testing.T) {
 				t.Fatal("Calling StepInstruction() repeatedly did not find the call instruction")
 			}
 
-			if strings.HasPrefix(curinstr.Text, "call") {
+			if strings.HasPrefix(curinstr.Text, "call") || strings.HasPrefix(curinstr.Text, "CALL") {
 				t.Logf("call: %v", curinstr)
 				if curinstr.DestLoc == nil || curinstr.DestLoc.Function == nil {
 					t.Fatalf("Call instruction does not have destination: %v", curinstr)
@@ -1242,6 +1249,9 @@ func TestClientServer_Issue528(t *testing.T) {
 }
 
 func TestClientServer_FpRegisters(t *testing.T) {
+	if runtime.GOARCH != "amd64" {
+		t.Skip("test is valid only on AMD64")
+	}
 	regtests := []struct{ name, value string }{
 		{"ST(0)", "0x3fffe666660000000000"},
 		{"ST(1)", "0x3fffd9999a0000000000"},
@@ -1552,6 +1562,9 @@ func mustHaveDebugCalls(t *testing.T, c service.Client) {
 }
 
 func TestClientServerFunctionCall(t *testing.T) {
+	if runtime.GOARCH == "arm64" {
+		t.Skip("arm64 does not support FunctionCall for now")
+	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 	withTestClient2("fncall", t, func(c service.Client) {
 		mustHaveDebugCalls(t, c)
@@ -1583,6 +1596,9 @@ func TestClientServerFunctionCall(t *testing.T) {
 }
 
 func TestClientServerFunctionCallBadPos(t *testing.T) {
+	if runtime.GOARCH == "arm64" {
+		t.Skip("arm64 does not support FunctionCall for now")
+	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 12) {
 		t.Skip("this is a safe point for Go 1.12")
@@ -1610,6 +1626,9 @@ func TestClientServerFunctionCallBadPos(t *testing.T) {
 }
 
 func TestClientServerFunctionCallPanic(t *testing.T) {
+	if runtime.GOARCH == "arm64" {
+		t.Skip("arm64 does not support FunctionCall for now")
+	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 	withTestClient2("fncall", t, func(c service.Client) {
 		mustHaveDebugCalls(t, c)
@@ -1636,6 +1655,9 @@ func TestClientServerFunctionCallPanic(t *testing.T) {
 }
 
 func TestClientServerFunctionCallStacktrace(t *testing.T) {
+	if runtime.GOARCH == "arm64" {
+		t.Skip("arm64 does not support FunctionCall for now")
+	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 	withTestClient2("fncall", t, func(c service.Client) {
 		mustHaveDebugCalls(t, c)
@@ -1779,6 +1801,16 @@ func TestRerecord(t *testing.T) {
 
 		if t0 == t2 {
 			t.Fatalf("Expected new value for t after restarting (with rerecording) %d %d", t0, t2)
+		}
+	})
+}
+
+func TestIssue1787(t *testing.T) {
+	// Calling FunctionReturnLocations without a selected goroutine should
+	// work.
+	withTestClient2("testnextprog", t, func(c service.Client) {
+		if c, _ := c.(*rpc2.RPCClient); c != nil {
+			c.FunctionReturnLocations("main.main")
 		}
 	})
 }

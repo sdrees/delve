@@ -231,6 +231,9 @@ type CreateBreakpointOut struct {
 // the breakpoint will be created on the specified function:line
 // location.
 //
+// - If arg.Breakpoint.Addrs is filled it will create a logical breakpoint
+// corresponding to all specified addresses.
+//
 // - Otherwise the value specified by arg.Breakpoint.Addr will be used.
 func (s *RPCServer) CreateBreakpoint(arg CreateBreakpointIn, out *CreateBreakpointOut) error {
 	createdbp, err := s.debugger.CreateBreakpoint(&arg.Breakpoint)
@@ -577,7 +580,7 @@ type FindLocationOut struct {
 	Locations []api.Location
 }
 
-// FindLocation returns concrete location information described by a location expression
+// FindLocation returns concrete location information described by a location expression.
 //
 //  loc ::= <filename>:<line> | <function>[:<line>] | /<regex>/ | (+|-)<offset> | <line> | *<address>
 //  * <filename> can be the full path of a file or just a suffix
@@ -726,5 +729,25 @@ type ListDynamicLibrariesOut struct {
 
 func (s *RPCServer) ListDynamicLibraries(in ListDynamicLibrariesIn, out *ListDynamicLibrariesOut) error {
 	out.List = s.debugger.ListDynamicLibraries()
+	return nil
+}
+
+// ListPackagesBuildInfoIn holds the arguments of ListPackages.
+type ListPackagesBuildInfoIn struct {
+	IncludeFiles bool
+}
+
+// ListPackagesBuildInfoOut holds the return values of ListPackages.
+type ListPackagesBuildInfoOut struct {
+	List []api.PackageBuildInfo
+}
+
+// ListPackagesBuildInfo returns the list of packages used by the program along with
+// the directory where each package was compiled and optionally the list of
+// files constituting the package.
+// Note that the directory path is a best guess and may be wrong is a tool
+// other than cmd/go is used to perform the build.
+func (s *RPCServer) ListPackagesBuildInfo(in ListPackagesBuildInfoIn, out *ListPackagesBuildInfoOut) error {
+	out.List = s.debugger.ListPackagesBuildInfo(in.IncludeFiles)
 	return nil
 }

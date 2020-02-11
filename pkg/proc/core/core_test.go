@@ -24,6 +24,7 @@ var buildMode string
 
 func TestMain(m *testing.M) {
 	flag.StringVar(&buildMode, "test-buildmode", "", "selects build mode")
+	flag.Parse()
 	if buildMode != "" && buildMode != "pie" {
 		fmt.Fprintf(os.Stderr, "unknown build mode %q", buildMode)
 		os.Exit(1)
@@ -147,7 +148,7 @@ func TestSplicedReader(t *testing.T) {
 	}
 }
 
-func withCoreFile(t *testing.T, name, args string) *Process {
+func withCoreFile(t *testing.T, name, args string) *proc.Target {
 	// This is all very fragile and won't work on hosts with non-default core patterns.
 	// Might be better to check in the binary and core?
 	tempDir, err := ioutil.TempDir("", "")

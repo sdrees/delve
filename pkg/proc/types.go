@@ -42,6 +42,11 @@ const (
 	interfacetypeFieldMhdr = "mhdr"
 )
 
+type runtimeTypeDIE struct {
+	offset dwarf.Offset
+	kind   int64
+}
+
 func pointerTo(typ godwarf.Type, arch Arch) godwarf.Type {
 	return &godwarf.PtrType{
 		CommonType: godwarf.CommonType{
@@ -73,16 +78,16 @@ func (v packageVarsByAddr) Less(i int, j int) bool { return v[i].addr < v[j].add
 func (v packageVarsByAddr) Swap(i int, j int)      { v[i], v[j] = v[j], v[i] }
 
 type loadDebugInfoMapsContext struct {
-	ardr                    *reader.Reader
-	abstractOriginNameTable map[dwarf.Offset]string
-	knownPackageVars        map[string]struct{}
+	ardr                *reader.Reader
+	abstractOriginTable map[dwarf.Offset]int
+	knownPackageVars    map[string]struct{}
 }
 
 func newLoadDebugInfoMapsContext(bi *BinaryInfo, image *Image) *loadDebugInfoMapsContext {
 	ctxt := &loadDebugInfoMapsContext{}
 
 	ctxt.ardr = image.DwarfReader()
-	ctxt.abstractOriginNameTable = make(map[dwarf.Offset]string)
+	ctxt.abstractOriginTable = make(map[dwarf.Offset]int)
 
 	ctxt.knownPackageVars = map[string]struct{}{}
 	for _, v := range bi.packageVars {

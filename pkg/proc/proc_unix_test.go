@@ -4,7 +4,6 @@ package proc_test
 
 import (
 	"fmt"
-	"runtime"
 	"syscall"
 	"testing"
 	"time"
@@ -23,10 +22,6 @@ func (npe errIssue419) Error() string {
 }
 
 func TestIssue419(t *testing.T) {
-	if testBackend == "lldb" && runtime.GOOS == "darwin" {
-		// debugserver bug?
-		return
-	}
 	if testBackend == "rr" {
 		return
 	}
@@ -34,7 +29,7 @@ func TestIssue419(t *testing.T) {
 	errChan := make(chan error, 2)
 
 	// SIGINT directed at the inferior should be passed along not swallowed by delve
-	withTestProcess("issue419", t, func(p proc.Process, fixture protest.Fixture) {
+	withTestProcess("issue419", t, func(p *proc.Target, fixture protest.Fixture) {
 		defer close(errChan)
 		setFunctionBreakpoint(p, t, "main.main")
 		assertNoError(proc.Continue(p), t, "Continue()")

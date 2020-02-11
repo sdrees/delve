@@ -58,7 +58,7 @@ func (t *Thread) StepInstruction() (err error) {
 		return err
 	}
 
-	bp, ok := t.dbp.FindBreakpoint(pc, true)
+	bp, ok := t.dbp.FindBreakpoint(pc, false)
 	if ok {
 		// Clear the breakpoint so that we can continue execution.
 		err = t.ClearBreakpoint(bp)
@@ -119,9 +119,18 @@ func (t *Thread) SetCurrentBreakpoint(adjustPC bool) error {
 	if err != nil {
 		return err
 	}
+
+	// If the breakpoint instruction does not change the value
+	// of PC after being executed we should look for breakpoints
+	// with bp.Addr == PC and there is no need to call SetPC
+	// after finding one.
+	adjustPC = adjustPC && t.Arch().BreakInstrMovesPC()
+
 	if bp, ok := t.dbp.FindBreakpoint(pc, adjustPC); ok {
-		if err = t.SetPC(bp.Addr); err != nil {
-			return err
+		if adjustPC {
+			if err = t.SetPC(bp.Addr); err != nil {
+				return err
+			}
 		}
 		t.CurrentBreakpoint = bp.CheckCondition(t)
 		if t.CurrentBreakpoint.Breakpoint != nil && t.CurrentBreakpoint.Active {
@@ -136,8 +145,8 @@ func (t *Thread) SetCurrentBreakpoint(adjustPC bool) error {
 
 // Breakpoint returns the current breakpoint that is active
 // on this thread.
-func (t *Thread) Breakpoint() proc.BreakpointState {
-	return t.CurrentBreakpoint
+func (t *Thread) Breakpoint() *proc.BreakpointState {
+	return &t.CurrentBreakpoint
 }
 
 // ThreadID returns the ID of this thread.

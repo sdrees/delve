@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -36,7 +37,7 @@ type Debugger struct {
 	processArgs []string
 	// TODO(DO NOT MERGE WITHOUT) rename to targetMutex
 	processMutex sync.Mutex
-	target       proc.Process
+	target       *proc.Target
 	log          *logrus.Entry
 
 	running      bool
@@ -101,7 +102,7 @@ func New(config *Config, processArgs []string) (*Debugger, error) {
 		d.target = p
 
 	case d.config.CoreFile != "":
-		var p proc.Process
+		var p *proc.Target
 		var err error
 		switch d.config.Backend {
 		case "rr":
@@ -164,7 +165,7 @@ func (d *Debugger) checkGoVersion() error {
 }
 
 // Launch will start a process with the given args and working directory.
-func (d *Debugger) Launch(processArgs []string, wd string) (proc.Process, error) {
+func (d *Debugger) Launch(processArgs []string, wd string) (*proc.Target, error) {
 	switch d.config.Backend {
 	case "native":
 		return native.Launch(processArgs, wd, d.config.Foreground, d.config.DebugInfoDirectories)
@@ -189,7 +190,7 @@ func (d *Debugger) Launch(processArgs []string, wd string) (proc.Process, error)
 var ErrNoAttachPath = errors.New("must specify executable path on macOS")
 
 // Attach will attach to the process specified by 'pid'.
-func (d *Debugger) Attach(pid int, path string) (proc.Process, error) {
+func (d *Debugger) Attach(pid int, path string) (*proc.Target, error) {
 	switch d.config.Backend {
 	case "native":
 		return native.Attach(pid, d.config.DebugInfoDirectories)
@@ -207,7 +208,7 @@ func (d *Debugger) Attach(pid int, path string) (proc.Process, error) {
 
 var errMacOSBackendUnavailable = errors.New("debugserver or lldb-server not found: install XCode's command line tools or lldb-server")
 
-func betterGdbserialLaunchError(p proc.Process, err error) (proc.Process, error) {
+func betterGdbserialLaunchError(p *proc.Target, err error) (*proc.Target, error) {
 	if runtime.GOOS != "darwin" {
 		return p, err
 	}
@@ -236,6 +237,9 @@ const deferReturn = "runtime.deferreturn"
 // for the given function, a list of addresses corresponding
 // to 'ret' or 'call runtime.deferreturn'.
 func (d *Debugger) FunctionReturnLocations(fnName string) ([]uint64, error) {
+	d.processMutex.Lock()
+	defer d.processMutex.Unlock()
+
 	var (
 		p = d.target
 		g = p.SelectedGoroutine()
@@ -248,7 +252,7 @@ func (d *Debugger) FunctionReturnLocations(fnName string) ([]uint64, error) {
 
 	var regs proc.Registers
 	var mem proc.MemoryReadWriter = p.CurrentThread()
-	if g.Thread != nil {
+	if g != nil && g.Thread != nil {
 		mem = g.Thread
 		regs, _ = g.Thread.Registers(false)
 	}
@@ -326,24 +330,25 @@ func (d *Debugger) Restart(rerecord bool, pos string, resetArgs bool, newArgs []
 		return nil, fmt.Errorf("could not launch process: %s", err)
 	}
 	discarded := []api.DiscardedBreakpoint{}
-	for _, oldBp := range d.breakpoints() {
+	for _, oldBp := range api.ConvertBreakpoints(d.breakpoints()) {
 		if oldBp.ID < 0 {
 			continue
 		}
 		if len(oldBp.File) > 0 {
-			var err error
-			oldBp.Addr, err = proc.FindFileLocation(p, oldBp.File, oldBp.Line)
+			addrs, err := proc.FindFileLocation(p, oldBp.File, oldBp.Line)
 			if err != nil {
 				discarded = append(discarded, api.DiscardedBreakpoint{Breakpoint: oldBp, Reason: err.Error()})
 				continue
 			}
-		}
-		newBp, err := p.SetBreakpoint(oldBp.Addr, proc.UserBreakpoint, nil)
-		if err != nil {
-			return nil, err
-		}
-		if err := copyBreakpointInfo(newBp, oldBp); err != nil {
-			return nil, err
+			createLogicalBreakpoint(p, addrs, oldBp)
+		} else {
+			newBp, err := p.SetBreakpoint(oldBp.Addr, proc.UserBreakpoint, nil)
+			if err != nil {
+				return nil, err
+			}
+			if err := copyBreakpointInfo(newBp, oldBp); err != nil {
+				return nil, err
+			}
 		}
 	}
 	d.target = p
@@ -413,9 +418,8 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoin
 	defer d.processMutex.Unlock()
 
 	var (
-		createdBp *api.Breakpoint
-		addr      uint64
-		err       error
+		addrs []uint64
+		err   error
 	)
 
 	if requestedBp.Name != "" {
@@ -429,7 +433,7 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoin
 
 	switch {
 	case requestedBp.TraceReturn:
-		addr = requestedBp.Addr
+		addrs = []uint64{requestedBp.Addr}
 	case len(requestedBp.File) > 0:
 		fileName := requestedBp.File
 		if runtime.GOOS == "windows" {
@@ -442,30 +446,59 @@ func (d *Debugger) CreateBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoin
 				}
 			}
 		}
-		addr, err = proc.FindFileLocation(d.target, fileName, requestedBp.Line)
+		addrs, err = proc.FindFileLocation(d.target, fileName, requestedBp.Line)
 	case len(requestedBp.FunctionName) > 0:
-		addr, err = proc.FindFunctionLocation(d.target, requestedBp.FunctionName, requestedBp.Line)
+		addrs, err = proc.FindFunctionLocation(d.target, requestedBp.FunctionName, requestedBp.Line)
+	case len(requestedBp.Addrs) > 0:
+		addrs = requestedBp.Addrs
 	default:
-		addr = requestedBp.Addr
+		addrs = []uint64{requestedBp.Addr}
 	}
 
 	if err != nil {
 		return nil, err
 	}
 
-	bp, err := d.target.SetBreakpoint(addr, proc.UserBreakpoint, nil)
+	createdBp, err := createLogicalBreakpoint(d.target, addrs, requestedBp)
 	if err != nil {
 		return nil, err
 	}
-	if err := copyBreakpointInfo(bp, requestedBp); err != nil {
-		if _, err1 := d.target.ClearBreakpoint(bp.Addr); err1 != nil {
-			err = fmt.Errorf("error while creating breakpoint: %v, additionally the breakpoint could not be properly rolled back: %v", err, err1)
+	d.log.Infof("created breakpoint: %#v", createdBp)
+	return createdBp, nil
+}
+
+// createLogicalBreakpoint creates one physical breakpoint for each address
+// in addrs and associates all of them with the same logical breakpoint.
+func createLogicalBreakpoint(p proc.Process, addrs []uint64, requestedBp *api.Breakpoint) (*api.Breakpoint, error) {
+	bps := make([]*proc.Breakpoint, len(addrs))
+	var err error
+	for i := range addrs {
+		bps[i], err = p.SetBreakpoint(addrs[i], proc.UserBreakpoint, nil)
+		if err != nil {
+			break
+		}
+		if i > 0 {
+			bps[i].LogicalID = bps[0].LogicalID
+		}
+		err = copyBreakpointInfo(bps[i], requestedBp)
+		if err != nil {
+			break
+		}
+	}
+	if err != nil {
+		for _, bp := range bps {
+			if bp == nil {
+				continue
+			}
+			if _, err1 := p.ClearBreakpoint(bp.Addr); err1 != nil {
+				err = fmt.Errorf("error while creating breakpoint: %v, additionally the breakpoint could not be properly rolled back: %v", err, err1)
+				return nil, err
+			}
 		}
 		return nil, err
 	}
-	createdBp = api.ConvertBreakpoint(bp)
-	d.log.Infof("created breakpoint: %#v", createdBp)
-	return createdBp, nil
+	createdBp := api.ConvertBreakpoints(bps)
+	return createdBp[0], nil // we created a single logical breakpoint, the slice here will always have len == 1
 }
 
 // AmendBreakpoint will update the breakpoint with the matching ID.
@@ -473,14 +506,19 @@ func (d *Debugger) AmendBreakpoint(amend *api.Breakpoint) error {
 	d.processMutex.Lock()
 	defer d.processMutex.Unlock()
 
-	original := d.findBreakpoint(amend.ID)
-	if original == nil {
+	originals := d.findBreakpoint(amend.ID)
+	if originals == nil {
 		return fmt.Errorf("no breakpoint with ID %d", amend.ID)
 	}
 	if err := api.ValidBreakpointName(amend.Name); err != nil {
 		return err
 	}
-	return copyBreakpointInfo(original, amend)
+	for _, original := range originals {
+		if err := copyBreakpointInfo(original, amend); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // CancelNext will clear internal breakpoints, thus cancelling the 'next',
@@ -524,16 +562,17 @@ func (d *Debugger) ClearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint
 func (d *Debugger) Breakpoints() []*api.Breakpoint {
 	d.processMutex.Lock()
 	defer d.processMutex.Unlock()
-	return d.breakpoints()
+	return api.ConvertBreakpoints(d.breakpoints())
 }
 
-func (d *Debugger) breakpoints() []*api.Breakpoint {
-	bps := []*api.Breakpoint{}
+func (d *Debugger) breakpoints() []*proc.Breakpoint {
+	bps := []*proc.Breakpoint{}
 	for _, bp := range d.target.Breakpoints().M {
 		if bp.IsUser() {
-			bps = append(bps, api.ConvertBreakpoint(bp))
+			bps = append(bps, bp)
 		}
 	}
+	sort.Sort(breakpointsByLogicalID(bps))
 	return bps
 }
 
@@ -541,21 +580,21 @@ func (d *Debugger) breakpoints() []*api.Breakpoint {
 func (d *Debugger) FindBreakpoint(id int) *api.Breakpoint {
 	d.processMutex.Lock()
 	defer d.processMutex.Unlock()
-
-	bp := d.findBreakpoint(id)
-	if bp == nil {
+	bps := api.ConvertBreakpoints(d.findBreakpoint(id))
+	if len(bps) <= 0 {
 		return nil
 	}
-	return api.ConvertBreakpoint(bp)
+	return bps[0]
 }
 
-func (d *Debugger) findBreakpoint(id int) *proc.Breakpoint {
+func (d *Debugger) findBreakpoint(id int) []*proc.Breakpoint {
+	var bps []*proc.Breakpoint
 	for _, bp := range d.target.Breakpoints().M {
-		if bp.ID == id {
-			return bp
+		if bp.LogicalID == id {
+			bps = append(bps, bp)
 		}
 	}
-	return nil
+	return bps
 }
 
 // FindBreakpointByName returns the breakpoint specified by 'name'
@@ -566,12 +605,18 @@ func (d *Debugger) FindBreakpointByName(name string) *api.Breakpoint {
 }
 
 func (d *Debugger) findBreakpointByName(name string) *api.Breakpoint {
+	var bps []*proc.Breakpoint
 	for _, bp := range d.breakpoints() {
 		if bp.Name == name {
-			return bp
+			bps = append(bps, bp)
 		}
 	}
-	return nil
+	if len(bps) == 0 {
+		return nil
+	}
+	sort.Sort(breakpointsByLogicalID(bps))
+	r := api.ConvertBreakpoints(bps)
+	return r[0] // there can only be one logical breakpoint with the same name
 }
 
 // Threads returns the threads of the target process.
@@ -672,7 +717,7 @@ func (d *Debugger) Command(command *api.DebuggerCommand) (*api.DebuggerState, er
 		err = proc.Step(d.target)
 	case api.StepInstruction:
 		d.log.Debug("single stepping")
-		err = d.target.StepInstruction()
+		err = proc.StepInstruction(d.target)
 	case api.ReverseStepInstruction:
 		d.log.Debug("reverse single stepping")
 		if err := d.target.Direction(proc.Backward); err != nil {
@@ -681,7 +726,7 @@ func (d *Debugger) Command(command *api.DebuggerCommand) (*api.DebuggerState, er
 		defer func() {
 			d.target.Direction(proc.Forward)
 		}()
-		err = d.target.StepInstruction()
+		err = proc.StepInstruction(d.target)
 	case api.StepOut:
 		d.log.Debug("step out")
 		err = proc.StepOut(d.target)
@@ -691,7 +736,10 @@ func (d *Debugger) Command(command *api.DebuggerCommand) (*api.DebuggerState, er
 		withBreakpointInfo = false
 	case api.SwitchGoroutine:
 		d.log.Debugf("switching to goroutine %d", command.GoroutineID)
-		err = d.target.SwitchGoroutine(command.GoroutineID)
+		g, err := proc.FindGoroutine(d.target, command.GoroutineID)
+		if err == nil {
+			err = d.target.SwitchGoroutine(g)
+		}
 		withBreakpointInfo = false
 	case api.Halt:
 		// RequestManualStop already called
@@ -1260,7 +1308,7 @@ func (d *Debugger) ListDynamicLibraries() []api.Image {
 	r := make([]api.Image, 0, len(bi.Images)-1)
 	// skips the first image because it's the executable file
 	for i := range bi.Images[1:] {
-		r = append(r, api.ConvertImage(bi.Images[i]))
+		r = append(r, api.ConvertImage(bi.Images[i+1]))
 	}
 	return r
 }
@@ -1292,6 +1340,35 @@ func (d *Debugger) GetVersion(out *api.GetVersionOut) error {
 	return nil
 }
 
+// ListPackagesBuildInfo returns the list of packages used by the program along with
+// the directory where each package was compiled and optionally the list of
+// files constituting the package.
+func (d *Debugger) ListPackagesBuildInfo(includeFiles bool) []api.PackageBuildInfo {
+	d.processMutex.Lock()
+	defer d.processMutex.Unlock()
+	pkgs := d.target.BinInfo().ListPackagesBuildInfo(includeFiles)
+	r := make([]api.PackageBuildInfo, 0, len(pkgs))
+	for _, pkg := range pkgs {
+		var files []string
+
+		if len(pkg.Files) > 0 {
+			files = make([]string, 0, len(pkg.Files))
+			for file := range pkg.Files {
+				files = append(files, file)
+			}
+		}
+
+		sort.Strings(files)
+
+		r = append(r, api.PackageBuildInfo{
+			ImportPath:    pkg.ImportPath,
+			DirectoryPath: pkg.DirectoryPath,
+			Files:         files,
+		})
+	}
+	return r
+}
+
 func go11DecodeErrorCheck(err error) error {
 	if _, isdecodeerr := err.(dwarf.DecodeError); !isdecodeerr {
 		return err
@@ -1303,4 +1380,16 @@ func go11DecodeErrorCheck(err error) error {
 	}
 
 	return fmt.Errorf("executables built by Go 1.11 or later need Delve built by Go 1.11 or later")
+}
+
+type breakpointsByLogicalID []*proc.Breakpoint
+
+func (v breakpointsByLogicalID) Len() int      { return len(v) }
+func (v breakpointsByLogicalID) Swap(i, j int) { v[i], v[j] = v[j], v[i] }
+
+func (v breakpointsByLogicalID) Less(i, j int) bool {
+	if v[i].LogicalID == v[j].LogicalID {
+		return v[i].Addr < v[j].Addr
+	}
+	return v[i].LogicalID < v[j].LogicalID
 }
