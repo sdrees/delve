@@ -14,6 +14,7 @@ Command | Description
 [continue](#continue) | Run until breakpoint or program termination.
 [next](#next) | Step over to next source line.
 [restart](#restart) | Restart process from a checkpoint or event.
+[rev](#rev) | Reverses the execution of the target program for the command specified.
 [rewind](#rewind) | Run backwards until breakpoint or program termination.
 [step](#step) | Single step through program.
 [step-instruction](#step-instruction) | Single step a single cpu instruction.
@@ -83,7 +84,6 @@ Command | Description
 [help](#help) | Prints the help message.
 [libraries](#libraries) | List loaded dynamic libraries
 [list](#list) | Show source code.
-[rev](#rev) | Reverses the execution of the target program for the command specified.
 [source](#source) | Executes a file containing a list of delve commands
 [sources](#sources) | Print list of source files.
 [types](#types) | Print list of types
@@ -301,7 +301,7 @@ Aliases: gr
 ## goroutines
 List program goroutines.
 
-	goroutines [-u (default: user location)|-r (runtime location)|-g (go statement location)|-s (start location)] [ -t (stack trace)]
+	goroutines [-u (default: user location)|-r (runtime location)|-g (go statement location)|-s (start location)] [-t (stack trace)] [-l (labels)]
 
 Print out info for every goroutine. The flag controls what information is shown along with each goroutine:
 
