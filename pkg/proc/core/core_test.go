@@ -134,10 +134,10 @@ func TestSplicedReader(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			mem := &SplicedMemory{}
+			mem := &splicedMemory{}
 			for _, region := range test.regions {
 				r := bytes.NewReader(region.data)
-				mem.Add(&OffsetReaderAt{r, 0}, region.off, region.length)
+				mem.Add(&offsetReaderAt{r, 0}, region.off, region.length)
 			}
 			got := make([]byte, test.readLen)
 			n, err := mem.ReadMemory(got, test.readAddr)
@@ -185,7 +185,7 @@ func withCoreFile(t *testing.T, name, args string) *proc.Target {
 	return p
 }
 
-func logRegisters(t *testing.T, regs proc.Registers, arch proc.Arch) {
+func logRegisters(t *testing.T, regs proc.Registers, arch *proc.Arch) {
 	dregs := arch.RegistersToDwarfRegisters(0, regs)
 	for i, reg := range dregs.Regs {
 		if reg == nil {
