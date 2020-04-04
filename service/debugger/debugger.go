@@ -1,6 +1,7 @@
 package debugger
 
 import (
+	"bytes"
 	"debug/dwarf"
 	"errors"
 	"fmt"
@@ -23,6 +24,17 @@ import (
 	"github.com/go-delve/delve/pkg/proc/native"
 	"github.com/go-delve/delve/service/api"
 	"github.com/sirupsen/logrus"
+)
+
+var (
+	// ErrCanNotRestart is returned when the target cannot be restarted.
+	// This is returned for targets that have been attached to, or when
+	// debugging core files.
+	ErrCanNotRestart = errors.New("can not restart this target")
+
+	// ErrNotRecording is returned when StopRecording is called while the
+	// debugger is not recording the target.
+	ErrNotRecording = errors.New("debugger is not recording")
 )
 
 // Debugger service.
@@ -178,6 +190,9 @@ func (d *Debugger) checkGoVersion() error {
 
 // Launch will start a process with the given args and working directory.
 func (d *Debugger) Launch(processArgs []string, wd string) (*proc.Target, error) {
+	if err := verifyBinaryFormat(processArgs[0]); err != nil {
+		return nil, err
+	}
 	switch d.config.Backend {
 	case "native":
 		return native.Launch(processArgs, wd, d.config.Foreground, d.config.DebugInfoDirectories)
@@ -258,11 +273,6 @@ func (d *Debugger) recordingRun(run func() (string, error)) (*proc.Target, error
 
 	return gdbserial.Replay(tracedir, false, true, d.config.DebugInfoDirectories)
 }
-
-// ErrNoAttachPath is the error returned when the client tries to attach to
-// a process on macOS using the lldb backend without specifying the path to
-// the target's executable.
-var ErrNoAttachPath = errors.New("must specify executable path on macOS")
 
 // Attach will attach to the process specified by 'pid'.
 func (d *Debugger) Attach(pid int, path string) (*proc.Target, error) {
@@ -367,12 +377,6 @@ func (d *Debugger) detach(kill bool) error {
 	}
 	return d.target.Detach(kill)
 }
-
-var ErrCanNotRestart = errors.New("can not restart this target")
-
-// ErrNotRecording is returned when StopRecording is called while the
-// debugger is not recording the target.
-var ErrNotRecording = errors.New("debugger is not recording")
 
 // Restart will restart the target process, first killing
 // and then exec'ing it again.
@@ -659,14 +663,51 @@ func (d *Debugger) ClearBreakpoint(requestedBp *api.Breakpoint) (*api.Breakpoint
 	d.processMutex.Lock()
 	defer d.processMutex.Unlock()
 
-	var clearedBp *api.Breakpoint
-	bp, err := d.target.ClearBreakpoint(requestedBp.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("Can't clear breakpoint @%x: %s", requestedBp.Addr, err)
+	var bps []*proc.Breakpoint
+	var errs []error
+
+	clear := func(addr uint64) {
+		bp, err := d.target.ClearBreakpoint(addr)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("address %#x: %v", addr, err))
+		}
+		if bp != nil {
+			bps = append(bps, bp)
+		}
 	}
-	clearedBp = api.ConvertBreakpoint(bp)
+
+	clearAddr := true
+	for _, addr := range requestedBp.Addrs {
+		if addr == requestedBp.Addr {
+			clearAddr = false
+		}
+		clear(addr)
+	}
+	if clearAddr {
+		clear(requestedBp.Addr)
+	}
+
+	if len(errs) > 0 {
+		buf := new(bytes.Buffer)
+		for i, err := range errs {
+			fmt.Fprintf(buf, "%s", err)
+			if i != len(errs)-1 {
+				fmt.Fprintf(buf, ", ")
+			}
+		}
+
+		if len(bps) == 0 {
+			return nil, fmt.Errorf("unable to clear breakpoint %d: %v", requestedBp.ID, buf.String())
+		}
+		return nil, fmt.Errorf("unable to clear breakpoint %d (partial): %s", requestedBp.ID, buf.String())
+	}
+
+	clearedBp := api.ConvertBreakpoints(bps)
+	if len(clearedBp) < 0 {
+		return nil, nil
+	}
 	d.log.Infof("cleared breakpoint: %#v", clearedBp)
-	return clearedBp, err
+	return clearedBp[0], nil
 }
 
 // Breakpoints returns the list of current breakpoints.
