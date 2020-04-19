@@ -21,6 +21,7 @@ import (
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
 	"github.com/go-delve/delve/service/dap"
+	"github.com/go-delve/delve/service/debugger"
 	"github.com/go-delve/delve/service/rpc2"
 	"github.com/go-delve/delve/service/rpccommon"
 	"github.com/spf13/cobra"
@@ -52,6 +53,8 @@ var (
 	// checkLocalConnUser is true if the debugger should check that local
 	// connections come from the same user that started the headless server
 	checkLocalConnUser bool
+	// tty is used to provide an alternate TTY for the program you wish to debug.
+	tty string
 
 	// backend selection
 	backend string
@@ -137,6 +140,7 @@ option to let the process continue or kill it.
 		},
 		Run: attachCmd,
 	}
+	attachCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
 	rootCommand.AddCommand(attachCommand)
 
 	// 'connect' subcommand.
@@ -184,6 +188,7 @@ session.`,
 	}
 	debugCommand.Flags().String("output", "./__debug_bin", "Output path for the binary.")
 	debugCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
+	debugCommand.Flags().StringVar(&tty, "tty", "", "TTY to use for the target program")
 	rootCommand.AddCommand(debugCommand)
 
 	// 'exec' subcommand.
@@ -207,6 +212,7 @@ or later, -gcflags="-N -l" on earlier versions of Go.`,
 			os.Exit(execute(0, args, conf, "", executingExistingFile))
 		},
 	}
+	execCommand.Flags().StringVar(&tty, "tty", "", "TTY to use for the target program")
 	execCommand.Flags().BoolVar(&continueOnStart, "continue", false, "Continue the debugged process on start.")
 	rootCommand.AddCommand(execCommand)
 
@@ -396,12 +402,15 @@ func dapCmd(cmd *cobra.Command, args []string) {
 		}
 		disconnectChan := make(chan struct{})
 		server := dap.NewServer(&service.Config{
-			Listener:             listener,
-			Backend:              backend,
-			Foreground:           true, // always headless
-			DebugInfoDirectories: conf.DebugInfoDirectories,
-			CheckGoVersion:       checkGoVersion,
-			DisconnectChan:       disconnectChan,
+			Listener:       listener,
+			DisconnectChan: disconnectChan,
+			Debugger: debugger.Config{
+				Backend:              backend,
+				Foreground:           headless && tty == "",
+				DebugInfoDirectories: conf.DebugInfoDirectories,
+				CheckGoVersion:       checkGoVersion,
+				TTY:                  tty,
+			},
 		})
 		defer server.Stop()
 
@@ -499,13 +508,15 @@ func traceCmd(cmd *cobra.Command, args []string) {
 
 		// Create and start a debug server
 		server := rpccommon.NewServer(&service.Config{
-			Listener:       listener,
-			ProcessArgs:    processArgs,
-			AttachPid:      traceAttachPid,
-			APIVersion:     2,
-			WorkingDir:     workingDir,
-			Backend:        backend,
-			CheckGoVersion: checkGoVersion,
+			Listener:    listener,
+			ProcessArgs: processArgs,
+			APIVersion:  2,
+			Debugger: debugger.Config{
+				AttachPid:      traceAttachPid,
+				WorkingDir:     workingDir,
+				Backend:        backend,
+				CheckGoVersion: checkGoVersion,
+			},
 		})
 		if err := server.Run(); err != nil {
 			fmt.Fprintln(os.Stderr, err)
@@ -733,19 +744,22 @@ func execute(attachPid int, processArgs []string, conf *config.Config, coreFile 
 	switch apiVersion {
 	case 1, 2:
 		server = rpccommon.NewServer(&service.Config{
-			Listener:             listener,
-			ProcessArgs:          processArgs,
-			AttachPid:            attachPid,
-			AcceptMulti:          acceptMulti,
-			APIVersion:           apiVersion,
-			WorkingDir:           workingDir,
-			Backend:              backend,
-			CoreFile:             coreFile,
-			Foreground:           headless,
-			DebugInfoDirectories: conf.DebugInfoDirectories,
-			CheckGoVersion:       checkGoVersion,
-			CheckLocalConnUser:   checkLocalConnUser,
-			DisconnectChan:       disconnectChan,
+			Listener:           listener,
+			ProcessArgs:        processArgs,
+			AcceptMulti:        acceptMulti,
+			APIVersion:         apiVersion,
+			CheckLocalConnUser: checkLocalConnUser,
+			DisconnectChan:     disconnectChan,
+			Debugger: debugger.Config{
+				AttachPid:            attachPid,
+				WorkingDir:           workingDir,
+				Backend:              backend,
+				CoreFile:             coreFile,
+				Foreground:           headless && tty == "",
+				DebugInfoDirectories: conf.DebugInfoDirectories,
+				CheckGoVersion:       checkGoVersion,
+				TTY:                  tty,
+			},
 		})
 	default:
 		fmt.Printf("Unknown API version: %d\n", apiVersion)

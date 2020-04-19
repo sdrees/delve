@@ -2,6 +2,7 @@ package native
 
 import (
 	"go/ast"
+	"os"
 	"runtime"
 	"sync"
 
@@ -33,6 +34,10 @@ type nativeProcess struct {
 	ptraceDoneChan      chan interface{}
 	childProcess        bool // this process was launched, not attached to
 	manualStopRequested bool
+
+	// Controlling terminal file descriptor for
+	// this process.
+	ctty *os.File
 
 	exited, detached bool
 }
@@ -301,7 +306,7 @@ func (dbp *nativeProcess) initialize(path string, debugInfoDirs []string) (*proc
 		Path:                path,
 		DebugInfoDirs:       debugInfoDirs,
 		WriteBreakpoint:     dbp.writeBreakpoint,
-		DisableAsyncPreempt: runtime.GOOS == "windows",
+		DisableAsyncPreempt: runtime.GOOS == "windows" || runtime.GOOS == "freebsd",
 		StopReason:          stopReason})
 }
 
@@ -343,6 +348,9 @@ func (dbp *nativeProcess) postExit() {
 	close(dbp.ptraceChan)
 	close(dbp.ptraceDoneChan)
 	dbp.bi.Close()
+	if dbp.ctty != nil {
+		dbp.ctty.Close()
+	}
 }
 
 func (dbp *nativeProcess) writeSoftwareBreakpoint(thread *nativeThread, addr uint64) error {
