@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-delve/delve/pkg/dwarf/op"
 	"github.com/go-delve/delve/pkg/goversion"
+	"github.com/go-delve/delve/pkg/locspec"
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/core"
@@ -349,7 +350,7 @@ func (d *Debugger) FunctionReturnLocations(fnName string) ([]uint64, error) {
 	var mem proc.MemoryReadWriter = p.CurrentThread()
 	if g != nil && g.Thread != nil {
 		mem = g.Thread
-		regs, _ = g.Thread.Registers(false)
+		regs, _ = g.Thread.Registers()
 	}
 	instructions, err := proc.Disassemble(mem, regs, p.Breakpoints(), p.BinInfo(), fn.Entry, fn.End)
 	if err != nil {
@@ -1069,7 +1070,18 @@ func (d *Debugger) Functions(filter string) ([]string, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
-	return regexFilterFuncs(filter, d.target.BinInfo().Functions)
+	regex, err := regexp.Compile(filter)
+	if err != nil {
+		return nil, fmt.Errorf("invalid filter argument: %s", err.Error())
+	}
+
+	funcs := []string{}
+	for _, f := range d.target.BinInfo().Functions {
+		if regex.MatchString(f.Name) {
+			funcs = append(funcs, f.Name)
+		}
+	}
+	return funcs, nil
 }
 
 // Types returns all type information in the binary.
@@ -1095,21 +1107,6 @@ func (d *Debugger) Types(filter string) ([]string, error) {
 	}
 
 	return r, nil
-}
-
-func regexFilterFuncs(filter string, allFuncs []proc.Function) ([]string, error) {
-	regex, err := regexp.Compile(filter)
-	if err != nil {
-		return nil, fmt.Errorf("invalid filter argument: %s", err.Error())
-	}
-
-	funcs := []string{}
-	for _, f := range allFuncs {
-		if regex.Match([]byte(f.Name)) {
-			funcs = append(funcs, f.Name)
-		}
-	}
-	return funcs, nil
 }
 
 // PackageVariables returns a list of package variables for the thread,
@@ -1162,13 +1159,16 @@ func (d *Debugger) Registers(threadID int, scope *api.EvalScope, floatingPoint b
 		if !found {
 			return nil, fmt.Errorf("couldn't find thread %d", threadID)
 		}
-		regs, err := thread.Registers(floatingPoint)
+		regs, err := thread.Registers()
 		if err != nil {
 			return nil, err
 		}
 		dregs = d.target.BinInfo().Arch.RegistersToDwarfRegisters(0, regs)
 	}
 	r := api.ConvertRegisters(dregs, d.target.BinInfo().Arch, floatingPoint)
+	if floatingPoint && dregs.FloatLoadError != nil {
+		return nil, dregs.FloatLoadError
+	}
 	// Sort the registers in a canonical order we prefer, this is mostly
 	// because the DWARF register numbering for AMD64 is weird.
 	sort.Slice(r, func(i, j int) bool {
@@ -1443,14 +1443,14 @@ func (d *Debugger) FindLocation(scope api.EvalScope, locStr string, includeNonEx
 		return nil, err
 	}
 
-	loc, err := parseLocationSpec(locStr)
+	loc, err := locspec.Parse(locStr)
 	if err != nil {
 		return nil, err
 	}
 
 	s, _ := proc.ConvertEvalScope(d.target, scope.GoroutineID, scope.Frame, scope.DeferredCall)
 
-	locs, err := loc.Find(d, s, locStr, includeNonExecutableLines)
+	locs, err := loc.Find(d.target, d.processArgs, s, locStr, includeNonExecutableLines)
 	for i := range locs {
 		if locs[i].PC == 0 {
 			continue
@@ -1491,7 +1491,7 @@ func (d *Debugger) Disassemble(goroutineID int, addr1, addr2 uint64, flavour api
 	if g != nil && g.Thread != nil {
 		curthread = g.Thread
 	}
-	regs, _ := curthread.Registers(false)
+	regs, _ := curthread.Registers()
 
 	insts, err := proc.Disassemble(curthread, regs, d.target.Breakpoints(), d.target.BinInfo(), addr1, addr2)
 	if err != nil {
