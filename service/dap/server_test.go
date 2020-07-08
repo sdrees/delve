@@ -166,17 +166,17 @@ func TestStopOnEntry(t *testing.T) {
 		}
 
 		// 8 >> stackTrace, << stackTrace
-		client.StackTraceRequest()
+		client.StackTraceRequest(1, 0, 20)
 		stResp := client.ExpectErrorResponse(t)
-		if stResp.Seq != 0 || stResp.RequestSeq != 8 || stResp.Message != "Not yet implemented" {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=8 Message=\"Not yet implemented\"", stResp)
+		if stResp.Seq != 0 || stResp.RequestSeq != 8 || stResp.Body.Error.Format != "Unable to produce stack trace: unknown goroutine 1" {
+			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=8 Format=\"Unable to produce stack trace: unknown goroutine 1\"", stResp)
 		}
 
 		// 9 >> stackTrace, << stackTrace
-		client.StackTraceRequest()
+		client.StackTraceRequest(1, 0, 20)
 		stResp = client.ExpectErrorResponse(t)
-		if stResp.Seq != 0 || stResp.RequestSeq != 9 || stResp.Message != "Not yet implemented" {
-			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=9 Message=\"Not yet implemented\"", stResp)
+		if stResp.Seq != 0 || stResp.RequestSeq != 9 || stResp.Body.Error.Id != 2004 {
+			t.Errorf("\ngot %#v\nwant Seq=0, RequestSeq=9 Id=2004", stResp)
 		}
 
 		// 10 >> continue, << continue, << terminated
@@ -306,8 +306,34 @@ func TestSetBreakpoint(t *testing.T) {
 			}
 		}
 
+		client.StackTraceRequest(1, 0, 20)
+		stResp := client.ExpectStackTraceResponse(t)
+
+		if stResp.Body.TotalFrames != 6 {
+			t.Errorf("\ngot %#v\nwant TotalFrames=6", stResp.Body.TotalFrames)
+		}
+		if len(stResp.Body.StackFrames) != 6 {
+			t.Errorf("\ngot %#v\nwant len(StackFrames)=6", stResp.Body.StackFrames)
+		} else {
+			expectFrame := func(got dap.StackFrame, id int, name string, sourceName string, line int) {
+				t.Helper()
+				if got.Id != id || got.Name != name {
+					t.Errorf("\ngot  %#v\nwant Id=%d Name=%s", got, id, name)
+				}
+				if (sourceName != "" && got.Source.Name != sourceName) || (line > 0 && got.Line != line) {
+					t.Errorf("\ngot  %#v\nwant Source.Name=%s Line=%d", got, sourceName, line)
+				}
+			}
+			expectFrame(stResp.Body.StackFrames[0], 1000, "main.Increment", "increment.go", 8)
+			expectFrame(stResp.Body.StackFrames[1], 1001, "main.Increment", "increment.go", 11)
+			expectFrame(stResp.Body.StackFrames[2], 1002, "main.Increment", "increment.go", 11)
+			expectFrame(stResp.Body.StackFrames[3], 1003, "main.main", "increment.go", 17)
+			expectFrame(stResp.Body.StackFrames[4], 1004, "runtime.main", "proc.go", -1)
+			expectFrame(stResp.Body.StackFrames[5], 1005, "runtime.goexit", "", -1)
+		}
+
 		// TODO(polina): add other status checking requests
-		// that are not yet supported (stackTrace, scopes, variables)
+		// that are not yet supported (scopes, variables)
 
 		client.ContinueRequest(1)
 		client.ExpectContinueResponse(t)
@@ -319,10 +345,144 @@ func TestSetBreakpoint(t *testing.T) {
 	})
 }
 
-// runDebugSesion is a helper for executing the standard init and shutdown
+// expectStackFrames is a helper for verifying the values within StackTraceResponse.
+//     wantStartLine - file line of the first returned frame (non-positive values are ignored).
+//     wantStartID - id of the first frame returned (ignored if wantFrames is 0).
+//     wantFrames - number of frames returned.
+//     wantTotalFrames - total number of stack frames (StackTraceResponse.Body.TotalFrames).
+func expectStackFrames(t *testing.T, got *dap.StackTraceResponse,
+	wantStartLine, wantStartID, wantFrames, wantTotalFrames int) {
+	t.Helper()
+	if got.Body.TotalFrames != wantTotalFrames {
+		t.Errorf("\ngot  %#v\nwant TotalFrames=%d", got.Body.TotalFrames, wantTotalFrames)
+	}
+	if len(got.Body.StackFrames) != wantFrames {
+		t.Errorf("\ngot  len(StackFrames)=%d\nwant %d", len(got.Body.StackFrames), wantFrames)
+	} else {
+		// Verify that frame ids are consecutive numbers starting at wantStartID
+		for i := 0; i < wantFrames; i++ {
+			if got.Body.StackFrames[i].Id != wantStartID+i {
+				t.Errorf("\ngot  %#v\nwant Id=%d", got.Body.StackFrames[i], wantStartID+i)
+			}
+		}
+		// Verify the line corresponding to the first returned frame (if any).
+		// This is useful when the first frame is the frame corresponding to the breakpoint at
+		// a predefined line. Values < 0 are a signal to skip the check (which can be useful
+		// for frames in the third-party code, where we do not control the lines).
+		if wantFrames > 0 && wantStartLine > 0 && got.Body.StackFrames[0].Line != wantStartLine {
+			t.Errorf("\ngot  Line=%d\nwant %d", got.Body.StackFrames[0].Line, wantStartLine)
+		}
+	}
+}
+
+// TestStackTraceRequest executes to a breakpoint (similarly to TestSetBreakpoint
+// that includes more thorough checking of that sequence) and tests different
+// good and bad configurations of 'stackTrace' requests.
+func TestStackTraceRequest(t *testing.T) {
+	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
+		var stResp *dap.StackTraceResponse
+		runDebugSessionWithBPs(t, client,
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{8, 18},
+			[]func(){
+				// Stop at line 8
+				func() {
+					t.Helper()
+					client.StackTraceRequest(1, 0, 0)
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 8, 1000, 6, 6)
+
+					// Even though the stack frames are the same,
+					// repeated requests at the same breakpoint,
+					// would assign unique ids to them each time.
+					client.StackTraceRequest(1, -100, 0) // Negative startFrame is treated as 0
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 8, 1006, 6, 6)
+
+					client.StackTraceRequest(1, 3, 0)
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 17, 1015, 3, 6)
+
+					client.StackTraceRequest(1, 6, 0)
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, -1, -1, 0, 6)
+
+					client.StackTraceRequest(1, 7, 0) // Out of bounds startFrame is capped at len
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, -1, -1, 0, 6)
+				},
+				// Stop at line 18
+				func() {
+					t.Helper()
+					// Frame ids get reset at each breakpoint.
+					client.StackTraceRequest(1, 0, 0)
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 18, 1000, 3, 3)
+
+					client.StackTraceRequest(1, 0, -100) // Negative levels is treated as 0
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 18, 1003, 3, 3)
+
+					client.StackTraceRequest(1, 0, 2)
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 18, 1006, 2, 3)
+
+					client.StackTraceRequest(1, 0, 3)
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 18, 1009, 3, 3)
+
+					client.StackTraceRequest(1, 0, 4) // Out of bounds levels is capped at len
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 18, 1012, 3, 3)
+
+					client.StackTraceRequest(1, 1, 2)
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, -1, 1016, 2, 3) // Don't test for runtime line we don't control
+				}})
+	})
+}
+
+// Tests that 'stackTraceDepth' from LaunchRequest is parsed and passed to
+// stacktrace requests handlers.
+func TestLaunchRequestWithStackTraceDepth(t *testing.T) {
+	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
+		var stResp *dap.StackTraceResponse
+		runDebugSessionWithBPs(t, client,
+			// Launch
+			func() {
+				client.LaunchRequestWithArgs(map[string]interface{}{
+					"mode": "exec", "program": fixture.Path, "stackTraceDepth": 1,
+				})
+			},
+			// Set breakpoints
+			fixture.Source, []int{8},
+			[]func(){
+				// Stop at line 8
+				func() {
+					t.Helper()
+					client.StackTraceRequest(1, 0, 0)
+					stResp = client.ExpectStackTraceResponse(t)
+					expectStackFrames(t, stResp, 8, 1000, 2, 2)
+				}})
+	})
+}
+
+// runDebugSesionWithBPs is a helper for executing the common init and shutdown
 // sequences for a program that does not stop on entry
-// while specifying unique launch criteria via parameters.
-func runDebugSession(t *testing.T, client *daptest.Client, launchRequest func()) {
+// while specifying breakpoints and unique launch criteria via parameters.
+//     launchRequest - a function that sends a launch request, so the test author
+//                     has full control of its arguments. Note that he rest of
+//                     the test sequence assumes that stopOneEntry is false.
+//     breakpoints   - list of lines, where breakpoints are to be set
+//     onBreakpoints - list of functions to be called at each of the above breakpoints.
+//                     These can be used to simulate additional editor-driven or
+//                     user-driven requests that could occur at each stopped breakpoint.
+func runDebugSessionWithBPs(t *testing.T, client *daptest.Client, launchRequest func(), source string, breakpoints []int, onBreakpoints []func()) {
+	t.Helper()
 	client.InitializeRequest()
 	client.ExpectInitializeResponse(t)
 
@@ -330,17 +490,34 @@ func runDebugSession(t *testing.T, client *daptest.Client, launchRequest func())
 	client.ExpectInitializedEvent(t)
 	client.ExpectLaunchResponse(t)
 
-	// Skip no-op setBreakpoints
+	client.SetBreakpointsRequest(source, breakpoints)
+	client.ExpectSetBreakpointsResponse(t)
+
 	// Skip no-op setExceptionBreakpoints
 
 	client.ConfigurationDoneRequest()
 	client.ExpectConfigurationDoneResponse(t)
 
-	// Program automatically continues to completion
+	// Program automatically continues to breakpoint or completion
+
+	for _, onBP := range onBreakpoints {
+		client.ExpectStoppedEvent(t)
+		onBP()
+		client.ContinueRequest(1)
+		client.ExpectContinueResponse(t)
+		// "Continue" is triggered after the response is sent
+	}
 
 	client.ExpectTerminatedEvent(t)
 	client.DisconnectRequest()
 	client.ExpectDisconnectResponse(t)
+}
+
+// runDebugSesion is a helper for executing the standard init and shutdown
+// sequences for a program that does not stop on entry
+// while specifying unique launch criteria via parameters.
+func runDebugSession(t *testing.T, client *daptest.Client, launchRequest func()) {
+	runDebugSessionWithBPs(t, client, launchRequest, "", nil, nil)
 }
 
 func TestLaunchDebugRequest(t *testing.T) {
@@ -476,9 +653,6 @@ func TestRequiredNotYetImplementedResponses(t *testing.T) {
 
 		client.PauseRequest()
 		expectNotYetImplemented("pause")
-
-		client.StackTraceRequest()
-		expectNotYetImplemented("stackTrace")
 
 		client.ScopesRequest()
 		expectNotYetImplemented("scopes")

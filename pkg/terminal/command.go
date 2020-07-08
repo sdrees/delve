@@ -143,6 +143,7 @@ For live targets the command takes the following forms:
 If newargv is omitted the process is restarted (or re-recorded) with the same argument vector.
 If -noargs is specified instead, the argument vector is cleared.
 `},
+		{aliases: []string{"rebuild"}, group: runCmds, cmdFn: c.rebuild, allowedPrefixes: revPrefix, helpMsg: "Rebuild the target executable and restarts it. It does not work if the executable was not built by delve."},
 		{aliases: []string{"continue", "c"}, group: runCmds, cmdFn: c.cont, allowedPrefixes: revPrefix, helpMsg: "Run until breakpoint or program termination."},
 		{aliases: []string{"step", "s"}, group: runCmds, cmdFn: c.step, allowedPrefixes: revPrefix, helpMsg: "Single step through program."},
 		{aliases: []string{"step-instruction", "si"}, group: runCmds, allowedPrefixes: revPrefix, cmdFn: c.stepInstruction, helpMsg: "Single step a single cpu instruction."},
@@ -1028,7 +1029,7 @@ func restartLive(t *Term, ctx callContext, args string) error {
 }
 
 func restartIntl(t *Term, rerecord bool, restartPos string, resetArgs bool, newArgv []string) error {
-	discarded, err := t.client.RestartFrom(rerecord, restartPos, resetArgs, newArgv)
+	discarded, err := t.client.RestartFrom(rerecord, restartPos, resetArgs, newArgv, false)
 	if err != nil {
 		return err
 	}
@@ -1042,10 +1043,11 @@ func parseNewArgv(args string) (resetArgs bool, newArgv []string, err error) {
 	if args == "" {
 		return false, nil, nil
 	}
-	v, err := argv.Argv([]rune(args), argv.ParseEnv(os.Environ()),
-		func(s []rune, _ map[string]string) ([]rune, error) {
-			return nil, fmt.Errorf("Backtick not supported in '%s'", string(s))
-		})
+	v, err := argv.Argv(args,
+		func(s string) (string, error) {
+			return "", fmt.Errorf("Backtick not supported in '%s'", s)
+		},
+		nil)
 	if err != nil {
 		return false, nil, err
 	}
@@ -1071,6 +1073,18 @@ func printcontextNoState(t *Term) {
 		return
 	}
 	printcontext(t, state)
+}
+
+func (c *Commands) rebuild(t *Term, ctx callContext, args string) error {
+	if ctx.Prefix == revPrefix {
+		return c.rewind(t, ctx, args)
+	}
+	defer t.onStop()
+	discarded, err := t.client.Restart(true)
+	if len(discarded) > 0 {
+		fmt.Printf("not all breakpoints could be restored.")
+	}
+	return err
 }
 
 func (c *Commands) cont(t *Term, ctx callContext, args string) error {
@@ -2269,7 +2283,7 @@ func printTracepoint(th *api.Thread, bpname string, fn *api.Function, args strin
 		fmt.Fprintf(os.Stderr, " => (%s)\n", strings.Join(retVals, ","))
 	}
 	if th.Breakpoint.TraceReturn || !hasReturnValue {
-		if th.BreakpointInfo.Stacktrace != nil {
+		if th.BreakpointInfo != nil && th.BreakpointInfo.Stacktrace != nil {
 			fmt.Fprintf(os.Stderr, "\tStack:\n")
 			printStack(os.Stderr, th.BreakpointInfo.Stacktrace, "\t\t", false)
 		}
