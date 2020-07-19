@@ -323,3 +323,33 @@ func TestIssue1636_InlineWithoutOrigin(t *testing.T) {
 	dwb.TagClose()
 	fakeBinaryInfo(t, dwb)
 }
+
+func TestUnsupportedType(t *testing.T) {
+	// Tests that reading an unsupported type does not cause an error
+	dwb := dwarfbuilder.New()
+	dwb.AddCompileUnit("main", 0x0)
+	off := dwb.TagOpen(dwarf.TagReferenceType, "blah")
+	dwb.TagClose()
+	dwb.TagClose()
+	_, dw := fakeBinaryInfo(t, dwb)
+	_, err := godwarf.ReadType(dw, 0, off, make(map[dwarf.Offset]godwarf.Type))
+	if err != nil {
+		t.Errorf("unexpected error reading unsupported type: %#v", err)
+	}
+}
+
+func TestNestedCompileUnts(t *testing.T) {
+	// Tests that a compile unit with a nested entry that we don't care about
+	// (such as a DW_TAG_namespace) is read fully.
+	dwb := dwarfbuilder.New()
+	dwb.AddCompileUnit("main", 0x0)
+	dwb.TagOpen(dwarf.TagNamespace, "namespace")
+	dwb.AddVariable("var1", 0x0, uint64(0x0))
+	dwb.TagClose()
+	dwb.AddVariable("var2", 0x0, uint64(0x0))
+	dwb.TagClose()
+	bi, _ := fakeBinaryInfo(t, dwb)
+	if n := len(bi.PackageVars()); n != 2 {
+		t.Errorf("expected 2 variables, got %d", n)
+	}
+}
