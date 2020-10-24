@@ -880,7 +880,7 @@ func (conn *gdbConn) appendThreadSelector(threadID string) {
 }
 
 // executes 'm' (read memory) command
-func (conn *gdbConn) readMemory(data []byte, addr uintptr) error {
+func (conn *gdbConn) readMemory(data []byte, addr uint64) error {
 	size := len(data)
 	data = data[:0]
 
@@ -894,7 +894,7 @@ func (conn *gdbConn) readMemory(data []byte, addr uintptr) error {
 		}
 		size = size - sz
 
-		fmt.Fprintf(&conn.outbuf, "$m%x,%x", addr+uintptr(len(data)), sz)
+		fmt.Fprintf(&conn.outbuf, "$m%x,%x", addr+uint64(len(data)), sz)
 		resp, err := conn.exec(conn.outbuf.Bytes(), "memory read")
 		if err != nil {
 			return err
@@ -915,7 +915,7 @@ func writeAsciiBytes(w io.Writer, data []byte) {
 }
 
 // executes 'M' (write memory) command
-func (conn *gdbConn) writeMemory(addr uintptr, data []byte) (written int, err error) {
+func (conn *gdbConn) writeMemory(addr uint64, data []byte) (written int, err error) {
 	if len(data) == 0 {
 		// LLDB can't parse requests for 0-length writes and hangs if we emit them
 		return 0, nil
@@ -1084,14 +1084,14 @@ func (conn *gdbConn) recv(cmd []byte, context string, binary bool) (resp []byte,
 		}
 
 		// read checksum
-		_, err = conn.rdr.Read(conn.inbuf[:2])
+		_, err = io.ReadFull(conn.rdr, conn.inbuf[:2])
 		if err != nil {
 			return nil, err
 		}
 		if logflags.GdbWire() {
 			out := resp
 			partial := false
-			if idx := bytes.Index(out, []byte{'\n'}); idx >= 0 {
+			if idx := bytes.Index(out, []byte{'\n'}); idx >= 0 && !binary {
 				out = resp[:idx]
 				partial = true
 			}
@@ -1100,9 +1100,17 @@ func (conn *gdbConn) recv(cmd []byte, context string, binary bool) (resp []byte,
 				partial = true
 			}
 			if !partial {
-				conn.log.Debugf("-> %s%s", string(resp), string(conn.inbuf[:2]))
+				if binary {
+					conn.log.Debugf("-> %q%s", string(resp), string(conn.inbuf[:2]))
+				} else {
+					conn.log.Debugf("-> %s%s", string(resp), string(conn.inbuf[:2]))
+				}
 			} else {
-				conn.log.Debugf("-> %s...", string(out))
+				if binary {
+					conn.log.Debugf("-> %q...", string(out))
+				} else {
+					conn.log.Debugf("-> %s...", string(out))
+				}
 			}
 		}
 
@@ -1136,7 +1144,7 @@ func (conn *gdbConn) recv(cmd []byte, context string, binary bool) (resp []byte,
 		conn.inbuf, resp = wiredecode(resp, conn.inbuf)
 	}
 
-	if len(resp) == 0 || resp[0] == 'E' {
+	if len(resp) == 0 || (resp[0] == 'E' && !binary) || (resp[0] == 'E' && len(resp) == 3) {
 		cmdstr := ""
 		if cmd != nil {
 			cmdstr = string(cmd)

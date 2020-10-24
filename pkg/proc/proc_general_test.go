@@ -1,8 +1,12 @@
 package proc
 
 import (
+	"path/filepath"
+	"runtime"
 	"testing"
 	"unsafe"
+
+	protest "github.com/go-delve/delve/pkg/proc/test"
 )
 
 func ptrSizeByRuntimeArch() int {
@@ -20,7 +24,7 @@ func TestIssue554(t *testing.T) {
 	case 8:
 		addr = 0xffffffffffffffff
 	}
-	if mem.contains(uintptr(addr), 40) {
+	if mem.contains(addr, 40) {
 		t.Fatalf("should be false")
 	}
 }
@@ -37,7 +41,7 @@ type memRead struct {
 	size int
 }
 
-func (dm *dummyMem) ReadMemory(buf []byte, addr uintptr) (int, error) {
+func (dm *dummyMem) ReadMemory(buf []byte, addr uint64) (int, error) {
 	dm.t.Logf("read addr=%#x size=%#x\n", addr, len(buf))
 	dm.reads = append(dm.reads, memRead{uint64(addr), len(buf)})
 	a := int64(addr) - int64(dm.base)
@@ -51,7 +55,7 @@ func (dm *dummyMem) ReadMemory(buf []byte, addr uintptr) (int, error) {
 	return len(buf), nil
 }
 
-func (dm *dummyMem) WriteMemory(uintptr, []byte) (int, error) {
+func (dm *dummyMem) WriteMemory(uint64, []byte) (int, error) {
 	panic("not supported")
 }
 
@@ -76,7 +80,7 @@ func TestReadCStringValue(t *testing.T) {
 		t.Logf("base is %#x\n", tc.base)
 		dm.base = tc.base
 		dm.reads = dm.reads[:0]
-		out, done, err := readCStringValue(dm, uintptr(tc.base), LoadConfig{MaxStringLen: maxstrlen})
+		out, done, err := readCStringValue(dm, tc.base, LoadConfig{MaxStringLen: maxstrlen})
 		if err != nil {
 			t.Errorf("base=%#x readCStringValue: %v", tc.base, err)
 		}
@@ -91,6 +95,26 @@ func TestReadCStringValue(t *testing.T) {
 		}
 		if tc.base == 0x4fff && dm.reads[0].size != 1 {
 			t.Errorf("base=%#x first read in not of one byte", tc.base)
+		}
+	}
+}
+
+func assertNoError(err error, t testing.TB, s string) {
+	if err != nil {
+		_, file, line, _ := runtime.Caller(1)
+		fname := filepath.Base(file)
+		t.Fatalf("failed assertion at %s:%d: %s - %s\n", fname, line, s, err)
+	}
+}
+
+func TestDwarfVersion(t *testing.T) {
+	// Tests that we correctly read the version of compilation units
+	fixture := protest.BuildFixture("math", 0)
+	bi := NewBinaryInfo(runtime.GOOS, runtime.GOARCH)
+	assertNoError(bi.LoadBinaryInfo(fixture.Path, 0, nil), t, "LoadBinaryInfo")
+	for _, cu := range bi.Images[0].compileUnits {
+		if cu.Version != 4 {
+			t.Errorf("compile unit %q at %#x has bad version %d", cu.name, cu.entry.Offset, cu.Version)
 		}
 	}
 }

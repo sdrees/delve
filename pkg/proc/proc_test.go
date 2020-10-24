@@ -8,6 +8,7 @@ import (
 	"go/constant"
 	"go/token"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -53,6 +54,34 @@ func TestMain(m *testing.M) {
 	os.Exit(protest.RunTestsWithFixtures(m))
 }
 
+func matchSkipConditions(conditions ...string) bool {
+	for _, cond := range conditions {
+		condfound := false
+		for _, s := range []string{runtime.GOOS, runtime.GOARCH, testBackend, buildMode} {
+			if s == cond {
+				condfound = true
+				break
+			}
+		}
+		if !condfound {
+			return false
+		}
+	}
+	return true
+}
+
+func skipOn(t testing.TB, reason string, conditions ...string) {
+	if matchSkipConditions(conditions...) {
+		t.Skipf("skipped on %s: %s", strings.Join(conditions, "/"), reason)
+	}
+}
+
+func skipUnlessOn(t testing.TB, reason string, conditions ...string) {
+	if !matchSkipConditions(conditions...) {
+		t.Skipf("skipped on %s: %s", strings.Join(conditions, "/"), reason)
+	}
+}
+
 func withTestProcess(name string, t testing.TB, fn func(p *proc.Target, fixture protest.Fixture)) {
 	withTestProcessArgs(name, t, ".", []string{}, 0, fn)
 }
@@ -68,13 +97,13 @@ func withTestProcessArgs(name string, t testing.TB, wd string, args []string, bu
 
 	switch testBackend {
 	case "native":
-		p, err = native.Launch(append([]string{fixture.Path}, args...), wd, false, []string{}, "")
+		p, err = native.Launch(append([]string{fixture.Path}, args...), wd, 0, []string{}, "", [3]string{})
 	case "lldb":
-		p, err = gdbserial.LLDBLaunch(append([]string{fixture.Path}, args...), wd, false, []string{}, "")
+		p, err = gdbserial.LLDBLaunch(append([]string{fixture.Path}, args...), wd, 0, []string{}, "", [3]string{})
 	case "rr":
 		protest.MustHaveRecordingAllowed(t)
 		t.Log("recording")
-		p, tracedir, err = gdbserial.RecordAndReplay(append([]string{fixture.Path}, args...), wd, true, []string{})
+		p, tracedir, err = gdbserial.RecordAndReplay(append([]string{fixture.Path}, args...), wd, true, []string{}, [3]string{})
 		t.Logf("replaying %q", tracedir)
 	default:
 		t.Fatal("unknown backend")
@@ -101,7 +130,7 @@ func getRegisters(p *proc.Target, t *testing.T) proc.Registers {
 
 func dataAtAddr(thread proc.MemoryReadWriter, addr uint64) ([]byte, error) {
 	data := make([]byte, 1)
-	_, err := thread.ReadMemory(data, uintptr(addr))
+	_, err := thread.ReadMemory(data, addr)
 	return data, err
 }
 
@@ -550,9 +579,7 @@ func TestNextGeneral(t *testing.T) {
 }
 
 func TestNextConcurrent(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	testcases := []nextTest{
 		{8, 9},
 		{9, 10},
@@ -588,9 +615,7 @@ func TestNextConcurrent(t *testing.T) {
 }
 
 func TestNextConcurrentVariant2(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	// Just like TestNextConcurrent but instead of removing the initial breakpoint we check that when it happens is for other goroutines
 	testcases := []nextTest{
 		{8, 9},
@@ -803,8 +828,8 @@ func TestSwitchThread(t *testing.T) {
 func TestCGONext(t *testing.T) {
 	// Test if one can do 'next' in a cgo binary
 	// On OSX with Go < 1.5 CGO is not supported due to: https://github.com/golang/go/issues/8973
-	if runtime.GOOS == "darwin" && strings.Contains(runtime.Version(), "1.4") {
-		return
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 5) {
+		skipOn(t, "upstream issue", "darwin")
 	}
 	protest.MustHaveCgo(t)
 
@@ -996,10 +1021,7 @@ func TestStacktraceGoroutine(t *testing.T) {
 }
 
 func TestKill(t *testing.T) {
-	if testBackend == "lldb" {
-		// k command presumably works but leaves the process around?
-		return
-	}
+	skipOn(t, "N/A", "lldb") // k command presumably works but leaves the process around?
 	withTestProcess("testprog", t, func(p *proc.Target, fixture protest.Fixture) {
 		if err := p.Detach(true); err != nil {
 			t.Fatal(err)
@@ -1043,8 +1065,8 @@ func TestGetG(t *testing.T) {
 	})
 
 	// On OSX with Go < 1.5 CGO is not supported due to: https://github.com/golang/go/issues/8973
-	if runtime.GOOS == "darwin" && strings.Contains(runtime.Version(), "1.4") {
-		return
+	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 5) {
+		skipOn(t, "upstream issue", "darwin")
 	}
 	protest.MustHaveCgo(t)
 
@@ -1106,7 +1128,7 @@ func TestProcessReceivesSIGCHLD(t *testing.T) {
 func TestIssue239(t *testing.T) {
 	withTestProcess("is sue239", t, func(p *proc.Target, fixture protest.Fixture) {
 		setFileBreakpoint(p, t, fixture.Source, 17)
-		assertNoError(p.Continue(), t, fmt.Sprintf("Continue()"))
+		assertNoError(p.Continue(), t, "Continue()")
 	})
 }
 
@@ -1293,9 +1315,23 @@ func TestFrameEvaluation(t *testing.T) {
 			found[vval] = true
 		}
 
+		firsterr := false
+		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
+			// We try to make sure that all goroutines are stopped at a sensible place
+			// before reading their stacktrace, but due to the nature of the test
+			// program there is no guarantee that we always find them in a reasonable
+			// state.
+			// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
+			// unnecessary flakiness allow a single goroutine to be in a bad state.
+			firsterr = true
+		}
 		for i := range found {
 			if !found[i] {
-				t.Fatalf("Goroutine %d not found\n", i)
+				if firsterr {
+					firsterr = false
+				} else {
+					t.Fatalf("Goroutine %d not found\n", i)
+				}
 			}
 		}
 
@@ -1399,9 +1435,7 @@ func TestIssue325(t *testing.T) {
 }
 
 func TestBreakpointCounts(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	protest.AllowRecording(t)
 	withTestProcess("bpcountstest", t, func(p *proc.Target, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 12)
@@ -1607,9 +1641,7 @@ func BenchmarkLocalVariables(b *testing.B) {
 }
 
 func TestCondBreakpoint(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	protest.AllowRecording(t)
 	withTestProcess("parallel_next", t, func(p *proc.Target, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 9)
@@ -1631,9 +1663,7 @@ func TestCondBreakpoint(t *testing.T) {
 }
 
 func TestCondBreakpointError(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	protest.AllowRecording(t)
 	withTestProcess("parallel_next", t, func(p *proc.Target, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 9)
@@ -1804,9 +1834,7 @@ func TestIssue396(t *testing.T) {
 }
 
 func TestIssue414(t *testing.T) {
-	if runtime.GOOS == "linux" && runtime.GOARCH == "386" && buildMode == "pie" {
-		t.Skip("test occasionally hangs on linux/386/pie")
-	}
+	skipOn(t, "broken", "linux", "386", "pie") // test occasionally hangs on linux/386/pie
 	// Stepping until the program exits
 	protest.AllowRecording(t)
 	withTestProcess("math", t, func(p *proc.Target, fixture protest.Fixture) {
@@ -1931,10 +1959,7 @@ func TestCmdLineArgs(t *testing.T) {
 }
 
 func TestIssue462(t *testing.T) {
-	// Stacktrace of Goroutine 0 fails with an error
-	if runtime.GOOS == "windows" {
-		return
-	}
+	skipOn(t, "broken", "windows") // Stacktrace of Goroutine 0 fails with an error
 	withTestProcess("testnextnethttp", t, func(p *proc.Target, fixture protest.Fixture) {
 		go func() {
 			// Wait for program to start listening.
@@ -1957,9 +1982,7 @@ func TestIssue462(t *testing.T) {
 }
 
 func TestNextParked(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	protest.AllowRecording(t)
 	withTestProcess("parallel_next", t, func(p *proc.Target, fixture protest.Fixture) {
 		bp := setFunctionBreakpoint(p, t, "main.sayhi")
@@ -2010,9 +2033,7 @@ func TestNextParked(t *testing.T) {
 }
 
 func TestStepParked(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	protest.AllowRecording(t)
 	withTestProcess("parallel_next", t, func(p *proc.Target, fixture protest.Fixture) {
 		bp := setFunctionBreakpoint(p, t, "main.sayhi")
@@ -2087,9 +2108,9 @@ func TestUnsupportedArch(t *testing.T) {
 
 	switch testBackend {
 	case "native":
-		p, err = native.Launch([]string{outfile}, ".", false, []string{}, "")
+		p, err = native.Launch([]string{outfile}, ".", 0, []string{}, "", [3]string{})
 	case "lldb":
-		p, err = gdbserial.LLDBLaunch([]string{outfile}, ".", false, []string{}, "")
+		p, err = gdbserial.LLDBLaunch([]string{outfile}, ".", 0, []string{}, "", [3]string{})
 	default:
 		t.Skip("test not valid for this backend")
 	}
@@ -2328,9 +2349,7 @@ func TestStepOut(t *testing.T) {
 }
 
 func TestStepConcurrentDirect(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	protest.AllowRecording(t)
 	withTestProcess("teststepconcurrent", t, func(p *proc.Target, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 37)
@@ -2394,9 +2413,7 @@ func TestStepConcurrentDirect(t *testing.T) {
 }
 
 func TestStepConcurrentPtr(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
+	skipOn(t, "broken", "freebsd")
 	protest.AllowRecording(t)
 	withTestProcess("teststepconcurrent", t, func(p *proc.Target, fixture protest.Fixture) {
 		setFileBreakpoint(p, t, fixture.Source, 24)
@@ -2538,14 +2555,13 @@ func TestStepOnCallPtrInstr(t *testing.T) {
 }
 
 func TestIssue594(t *testing.T) {
-	if runtime.GOOS == "darwin" && testBackend == "lldb" {
-		// debugserver will receive an EXC_BAD_ACCESS for this, at that point
-		// there is no way to reconvert this exception into a unix signal and send
-		// it to the process.
-		// This is a bug in debugserver/lldb:
-		//  https://bugs.llvm.org//show_bug.cgi?id=22868
-		return
-	}
+	skipOn(t, "upstream issue", "darwin", "lldb")
+	// debugserver will receive an EXC_BAD_ACCESS for this, at that point
+	// there is no way to reconvert this exception into a unix signal and send
+	// it to the process.
+	// This is a bug in debugserver/lldb:
+	//  https://bugs.llvm.org//show_bug.cgi?id=22868
+
 	// Exceptions that aren't caused by breakpoints should be propagated
 	// back to the target.
 	// In particular the target should be able to cause a nil pointer
@@ -2653,7 +2669,7 @@ func TestIssue664(t *testing.T) {
 	})
 }
 
-// Benchmarks (*Processs).Continue + (*Scope).FunctionArguments
+// Benchmarks (*Process).Continue + (*Scope).FunctionArguments
 func BenchmarkTrace(b *testing.B) {
 	withTestProcess("traceperf", b, func(p *proc.Target, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, b, "main.PerfCheck")
@@ -3462,10 +3478,7 @@ func TestSystemstackOnRuntimeNewstack(t *testing.T) {
 }
 
 func TestIssue1034(t *testing.T) {
-	if runtime.GOARCH == "386" {
-		t.Skip("cgo stacktraces not supported on i386 for now")
-	}
-
+	skipOn(t, "broken - cgo stacktraces", "386")
 	protest.MustHaveCgo(t)
 
 	// The external linker on macOS produces an abbrev for DW_TAG_subprogram
@@ -3485,10 +3498,7 @@ func TestIssue1034(t *testing.T) {
 }
 
 func TestIssue1008(t *testing.T) {
-	if runtime.GOARCH == "386" {
-		t.Skip("cgo stacktraces not supported on i386 for now")
-	}
-
+	skipOn(t, "broken - cgo stacktraces", "386")
 	protest.MustHaveCgo(t)
 
 	// The external linker on macOS inserts "end of sequence" extended opcodes
@@ -3641,9 +3651,7 @@ func TestIssue1145(t *testing.T) {
 }
 
 func TestDisassembleGlobalVars(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("On ARM64 symLookup can't look up variables due to how they are loaded, see issue #1778")
-	}
+	skipOn(t, "broken - global variable symbolication", "arm64") // On ARM64 symLookup can't look up variables due to how they are loaded, see issue #1778
 	// On 386 linux when pie, the genered code use __x86.get_pc_thunk to ensure position-independent.
 	// Locate global variable by
 	//    `CALL __x86.get_pc_thunk.ax(SB) 0xb0f7f
@@ -3958,9 +3966,7 @@ func TestIssue951(t *testing.T) {
 }
 
 func TestDWZCompression(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("test is not valid on ARM64")
-	}
+	skipOn(t, "broken", "arm64")
 	// If dwz is not available in the system, skip this test
 	if _, err := exec.LookPath("dwz"); err != nil {
 		t.Skip("dwz not installed")
@@ -4142,9 +4148,7 @@ func TestReadDefer(t *testing.T) {
 }
 
 func TestNextUnknownInstr(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skip("amd64 only")
-	}
+	skipUnlessOn(t, "amd64 only", "amd64")
 	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 10) {
 		t.Skip("versions of Go before 1.10 can't assemble the instruction VPUNPCKLWD")
 	}
@@ -4156,9 +4160,6 @@ func TestNextUnknownInstr(t *testing.T) {
 }
 
 func TestReadDeferArgs(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support ReadDeferArgs for now")
-	}
 	var tests = []struct {
 		frame, deferCall int
 		a, b             int64
@@ -4298,9 +4299,7 @@ func TestIssue1469(t *testing.T) {
 }
 
 func TestDeadlockBreakpoint(t *testing.T) {
-	if buildMode == "pie" {
-		t.Skip("See https://github.com/golang/go/issues/29322")
-	}
+	skipOn(t, "upstream issue - https://github.com/golang/go/issues/29322", "pie")
 	deadlockBp := proc.FatalThrow
 	if !goversion.VersionAfterOrEqual(runtime.Version(), 1, 11) {
 		deadlockBp = proc.UnrecoveredPanic
@@ -4435,10 +4434,7 @@ func testCallConcurrentCheckReturns(p *proc.Target, t *testing.T, gid1, gid2 int
 }
 
 func TestCallConcurrent(t *testing.T) {
-	if runtime.GOOS == "freebsd" {
-		t.Skip("test is not valid on FreeBSD")
-	}
-
+	skipOn(t, "broken", "freebsd")
 	protest.MustSupportFunctionCalls(t, testBackend)
 	withTestProcess("teststepconcurrent", t, func(p *proc.Target, fixture protest.Fixture) {
 		bp := setFileBreakpoint(p, t, fixture.Source, 24)
@@ -4521,9 +4517,9 @@ func TestIssue1615(t *testing.T) {
 }
 
 func TestCgoStacktrace2(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("fixture crashes go runtime on windows")
-	}
+	skipOn(t, "upstream issue", "windows")
+	skipOn(t, "broken", "386")
+	skipOn(t, "broken", "arm64")
 	protest.MustHaveCgo(t)
 	// If a panic happens during cgo execution the stacktrace should show the C
 	// function that caused the problem.
@@ -4532,14 +4528,15 @@ func TestCgoStacktrace2(t *testing.T) {
 		frames, err := proc.ThreadStacktrace(p.CurrentThread(), 100)
 		assertNoError(err, t, "Stacktrace()")
 		logStacktrace(t, p.BinInfo(), frames)
-		stacktraceCheck(t, []string{"C.sigsegv", "C.testfn", "main.main"}, frames)
+		m := stacktraceCheck(t, []string{"C.sigsegv", "C.testfn", "main.main"}, frames)
+		if m == nil {
+			t.Fatal("see previous loglines")
+		}
 	})
 }
 
 func TestIssue1656(t *testing.T) {
-	if runtime.GOARCH != "amd64" {
-		t.Skip("amd64 only")
-	}
+	skipUnlessOn(t, "amd64 only", "amd64")
 	withTestProcess("issue1656/", t, func(p *proc.Target, fixture protest.Fixture) {
 		setFileBreakpoint(p, t, filepath.ToSlash(filepath.Join(fixture.BuildDir, "main.s")), 5)
 		assertNoError(p.Continue(), t, "Continue()")
@@ -4557,9 +4554,7 @@ func TestBreakpointConfusionOnResume(t *testing.T) {
 	// native.(*Thread).singleStep all agree on which breakpoint the thread is
 	// stopped at.
 	// This test checks for a regression introduced when fixing Issue #1656
-	if runtime.GOARCH != "amd64" {
-		t.Skip("amd64 only")
-	}
+	skipUnlessOn(t, "amd64 only", "amd64")
 	withTestProcess("nopbreakpoint/", t, func(p *proc.Target, fixture protest.Fixture) {
 		maindots := filepath.ToSlash(filepath.Join(fixture.BuildDir, "main.s"))
 		maindotgo := filepath.ToSlash(filepath.Join(fixture.BuildDir, "main.go"))
@@ -4808,9 +4803,7 @@ func TestIssue1925(t *testing.T) {
 }
 
 func TestStepIntoWrapperForEmbeddedPointer(t *testing.T) {
-	if runtime.GOOS == "linux" && runtime.GOARCH == "386" && buildMode == "pie" {
-		t.Skip("Skipping wrappers doesn't work on linux/386/PIE due to the use of get_pc_thunk")
-	}
+	skipOn(t, "N/A", "linux", "386", "pie") // skipping wrappers doesn't work on linux/386/PIE due to the use of get_pc_thunk
 	// Under some circumstances (when using an interface to call a method on an
 	// embedded field, see _fixtures/ifaceembcall.go) the compiler will
 	// autogenerate a wrapper function that uses a tail call (i.e. it ends in
@@ -4859,9 +4852,7 @@ func TestRefreshCurThreadSelGAfterContinueOnceError(t *testing.T) {
 	// refreshed after ContinueOnce returns an error due to a segmentation
 	// fault.
 
-	if runtime.GOOS != "darwin" && testBackend != "lldb" {
-		t.Skip("not applicable")
-	}
+	skipUnlessOn(t, "N/A", "darwin", "lldb")
 
 	withTestProcess("issue2078", t, func(p *proc.Target, fixture protest.Fixture) {
 		setFileBreakpoint(p, t, fixture.Source, 4)
@@ -4889,6 +4880,114 @@ func TestStepoutOneliner(t *testing.T) {
 		assertNoError(p.StepOut(), t, "second StepOut()")
 		if fn := p.BinInfo().PCToFunc(currentPC(p, t)); fn == nil || fn.Name != "main.main" {
 			t.Fatalf("wrong fnuction after second stepout %#v", fn)
+		}
+	})
+}
+
+func TestRequestManualStopWhileStopped(t *testing.T) {
+	// Requesting a manual stop while stopped shouldn't cause problems (issue #2138).
+	withTestProcess("issue2138", t, func(p *proc.Target, fixture protest.Fixture) {
+		resumed := make(chan struct{})
+		setFileBreakpoint(p, t, fixture.Source, 8)
+		assertNoError(p.Continue(), t, "Continue() 1")
+		p.ResumeNotify(resumed)
+		go func() {
+			<-resumed
+			time.Sleep(1 * time.Second)
+			p.RequestManualStop()
+		}()
+		t.Logf("at time.Sleep call")
+		assertNoError(p.Continue(), t, "Continue() 2")
+		t.Logf("manually stopped")
+		p.RequestManualStop()
+		p.RequestManualStop()
+		p.RequestManualStop()
+
+		resumed = make(chan struct{})
+		p.ResumeNotify(resumed)
+		go func() {
+			<-resumed
+			time.Sleep(1 * time.Second)
+			p.RequestManualStop()
+		}()
+		t.Logf("resuming sleep")
+		assertNoError(p.Continue(), t, "Continue() 3")
+		t.Logf("done")
+	})
+}
+
+func TestStepOutPreservesGoroutine(t *testing.T) {
+	// Checks that StepOut preserves the currently selected goroutine.
+	skipOn(t, "broken", "freebsd")
+	rand.Seed(time.Now().Unix())
+	withTestProcess("issue2113", t, func(p *proc.Target, fixture protest.Fixture) {
+		assertNoError(p.Continue(), t, "Continue()")
+
+		logState := func() {
+			g := p.SelectedGoroutine()
+			var goid int = -42
+			if g != nil {
+				goid = g.ID
+			}
+			pc := currentPC(p, t)
+			f, l, fn := p.BinInfo().PCToLine(pc)
+			var fnname string = "???"
+			if fn != nil {
+				fnname = fn.Name
+			}
+			t.Logf("goroutine %d at %s:%d in %s", goid, f, l, fnname)
+		}
+
+		logState()
+
+		gs, _, err := proc.GoroutinesInfo(p, 0, 0)
+		assertNoError(err, t, "GoroutinesInfo")
+		candg := []*proc.G{}
+		bestg := []*proc.G{}
+		for _, g := range gs {
+			frames, err := g.Stacktrace(20, 0)
+			assertNoError(err, t, "Stacktrace")
+			for _, frame := range frames {
+				if frame.Call.Fn != nil && frame.Call.Fn.Name == "main.coroutine" {
+					candg = append(candg, g)
+					if g.Thread != nil && frames[0].Call.Fn != nil && strings.HasPrefix(frames[0].Call.Fn.Name, "runtime.") {
+						bestg = append(bestg, g)
+					}
+					break
+				}
+			}
+		}
+		var pickg *proc.G
+		if len(bestg) > 0 {
+			pickg = bestg[rand.Intn(len(bestg))]
+			t.Logf("selected goroutine %d (best)\n", pickg.ID)
+		} else {
+			pickg = candg[rand.Intn(len(candg))]
+			t.Logf("selected goroutine %d\n", pickg.ID)
+
+		}
+		goid := pickg.ID
+		assertNoError(p.SwitchGoroutine(pickg), t, "SwitchGoroutine")
+
+		logState()
+
+		err = p.StepOut()
+		if err != nil {
+			_, isexited := err.(proc.ErrProcessExited)
+			if !isexited {
+				assertNoError(err, t, "StepOut()")
+			} else {
+				return
+			}
+		}
+
+		logState()
+
+		g2 := p.SelectedGoroutine()
+		if g2 == nil {
+			t.Fatalf("no selected goroutine after stepout")
+		} else if g2.ID != goid {
+			t.Fatalf("unexpected selected goroutine %d", g2.ID)
 		}
 	})
 }

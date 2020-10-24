@@ -36,6 +36,9 @@ const (
 	// version of the kernel ('T' is job control stop on modern 3.x+ kernels) we
 	// may want to differentiate at some point.
 	statusTraceStopT = 'T'
+
+	personalityGetPersonality = 0xffffffff // argument to pass to personality syscall to get the current personality
+	_ADDR_NO_RANDOMIZE        = 0x0040000  // ADDR_NO_RANDOMIZE linux constant
 )
 
 // osProcessDetails contains Linux specific
@@ -49,13 +52,20 @@ type osProcessDetails struct {
 // to be supplied to that process. `wd` is working directory of the program.
 // If the DWARF information cannot be found in the binary, Delve will look
 // for external debug files in the directories passed in.
-func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string, tty string) (*proc.Target, error) {
+func Launch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs []string, tty string, redirects [3]string) (*proc.Target, error) {
 	var (
 		process *exec.Cmd
 		err     error
 	)
 
-	if !isatty.IsTerminal(os.Stdin.Fd()) {
+	foreground := flags&proc.LaunchForeground != 0
+
+	stdin, stdout, stderr, closefn, err := openRedirects(redirects, foreground)
+	if err != nil {
+		return nil, err
+	}
+
+	if stdin == nil || !isatty.IsTerminal(stdin.Fd()) {
 		// exec.(*Process).Start will fail if we try to send a process to
 		// foreground but we are not attached to a terminal.
 		foreground = false
@@ -68,10 +78,20 @@ func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string, tt
 		}
 	}()
 	dbp.execPtraceFunc(func() {
+		if flags&proc.LaunchDisableASLR != 0 {
+			oldPersonality, _, err := syscall.Syscall(sys.SYS_PERSONALITY, personalityGetPersonality, 0, 0)
+			if err == syscall.Errno(0) {
+				newPersonality := oldPersonality | _ADDR_NO_RANDOMIZE
+				syscall.Syscall(sys.SYS_PERSONALITY, newPersonality, 0, 0)
+				defer syscall.Syscall(sys.SYS_PERSONALITY, oldPersonality, 0, 0)
+			}
+		}
+
 		process = exec.Command(cmd[0])
 		process.Args = cmd
-		process.Stdout = os.Stdout
-		process.Stderr = os.Stderr
+		process.Stdin = stdin
+		process.Stdout = stdout
+		process.Stderr = stderr
 		process.SysProcAttr = &syscall.SysProcAttr{
 			Ptrace:     true,
 			Setpgid:    true,
@@ -79,7 +99,6 @@ func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string, tt
 		}
 		if foreground {
 			signal.Ignore(syscall.SIGTTOU, syscall.SIGTTIN)
-			process.Stdin = os.Stdin
 		}
 		if tty != "" {
 			dbp.ctty, err = attachProcessToTTY(process, tty)
@@ -92,6 +111,7 @@ func Launch(cmd []string, wd string, foreground bool, debugInfoDirs []string, tt
 		}
 		err = process.Start()
 	})
+	closefn()
 	if err != nil {
 		return nil, err
 	}
@@ -124,12 +144,7 @@ func Attach(pid int, debugInfoDirs []string) (*proc.Target, error) {
 		return nil, err
 	}
 
-	execPath, err := findExecutable(pid)
-	if err != nil {
-		return nil, err
-	}
-
-	tgt, err := dbp.initialize(execPath, debugInfoDirs)
+	tgt, err := dbp.initialize(findExecutable("", dbp.pid), debugInfoDirs)
 	if err != nil {
 		_ = dbp.Detach(false)
 		return nil, err
@@ -259,9 +274,11 @@ func (dbp *nativeProcess) updateThreadList() error {
 	return linutil.ElfUpdateSharedObjects(dbp)
 }
 
-func findExecutable(pid int) (string, error) {
-	path := fmt.Sprintf("/proc/%d/exe", pid)
-	return filepath.EvalSymlinks(path)
+func findExecutable(path string, pid int) string {
+	if path == "" {
+		path = fmt.Sprintf("/proc/%d/exe", pid)
+	}
+	return path
 }
 
 func (dbp *nativeProcess) trapWait(pid int) (*nativeThread, error) {
@@ -273,6 +290,7 @@ type trapWaitOptions uint8
 const (
 	trapWaitHalt trapWaitOptions = 1 << iota
 	trapWaitNohang
+	trapWaitDontCallExitGuard
 )
 
 func (dbp *nativeProcess) trapWaitInternal(pid int, options trapWaitOptions) (*nativeThread, error) {
@@ -368,11 +386,10 @@ func (dbp *nativeProcess) trapWaitInternal(pid int, options trapWaitOptions) (*n
 			th.os.running = false
 			return th, nil
 		} else if err := th.resumeWithSig(int(status.StopSignal())); err != nil {
-			if err == sys.ESRCH {
-				dbp.postExit()
-				return nil, proc.ErrProcessExited{Pid: dbp.pid}
+			if options&trapWaitDontCallExitGuard != 0 {
+				return nil, err
 			}
-			return nil, err
+			return nil, dbp.exitGuard(err)
 		}
 	}
 }
@@ -442,7 +459,7 @@ func (dbp *nativeProcess) exitGuard(err error) error {
 		return err
 	}
 	if status(dbp.pid, dbp.os.comm) == statusZombie {
-		_, err := dbp.trapWaitInternal(-1, 0)
+		_, err := dbp.trapWaitInternal(-1, trapWaitDontCallExitGuard)
 		return err
 	}
 

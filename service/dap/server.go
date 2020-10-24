@@ -12,11 +12,13 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"go/constant"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 
 	"github.com/go-delve/delve/pkg/gobuild"
 	"github.com/go-delve/delve/pkg/logflags"
@@ -59,7 +61,7 @@ type Server struct {
 	stackFrameHandles *handlesMap
 	// variableHandles maps compound variables to unique references within their stack frame.
 	// See also comment for convertVariable.
-	variableHandles *handlesMap
+	variableHandles *variablesHandlesMap
 	// args tracks special settings for handling debug session requests.
 	args launchAttachArgs
 }
@@ -71,12 +73,15 @@ type launchAttachArgs struct {
 	stopOnEntry bool
 	// stackTraceDepth is the maximum length of the returned list of stack frames.
 	stackTraceDepth int
+	// showGlobalVariables indicates if global package variables should be loaded.
+	showGlobalVariables bool
 }
 
 // defaultArgs borrows the defaults for the arguments from the original vscode-go adapter.
 var defaultArgs = launchAttachArgs{
-	stopOnEntry:     false,
-	stackTraceDepth: 50,
+	stopOnEntry:         false,
+	stackTraceDepth:     50,
+	showGlobalVariables: false,
 }
 
 // NewServer creates a new DAP Server. It takes an opened Listener
@@ -93,7 +98,7 @@ func NewServer(config *service.Config) *Server {
 		stopChan:          make(chan struct{}),
 		log:               logger,
 		stackFrameHandles: newHandlesMap(),
-		variableHandles:   newHandlesMap(),
+		variableHandles:   newVariablesHandlesMap(),
 		args:              defaultArgs,
 	}
 }
@@ -257,15 +262,12 @@ func (s *Server) handleRequest(request dap.Message) {
 		s.onContinueRequest(request)
 	case *dap.NextRequest:
 		// Required
-		// TODO: implement this request in V0
 		s.onNextRequest(request)
 	case *dap.StepInRequest:
 		// Required
-		// TODO: implement this request in V0
 		s.onStepInRequest(request)
 	case *dap.StepOutRequest:
 		// Required
-		// TODO: implement this request in V0
 		s.onStepOutRequest(request)
 	case *dap.StepBackRequest:
 		// Optional (capability ‘supportsStepBack’)
@@ -378,6 +380,7 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	// TODO(polina): Respond with an error if debug session is in progress?
 	response := &dap.InitializeResponse{Response: *newResponse(request.Request)}
 	response.Body.SupportsConfigurationDoneRequest = true
+	response.Body.SupportsConditionalBreakpoints = true
 	// TODO(polina): support this to match vscode-go functionality
 	response.Body.SupportsSetVariable = false
 	// TODO(polina): support these requests in addition to vscode-go feature parity
@@ -459,12 +462,18 @@ func (s *Server) onLaunchRequest(request *dap.LaunchRequest) {
 		return
 	}
 
-	stop, ok := request.Arguments["stopOnEntry"]
-	s.args.stopOnEntry = ok && stop == true
-
+	// If user-specified, overwrite the defaults for optional args.
+	stop, ok := request.Arguments["stopOnEntry"].(bool)
+	if ok {
+		s.args.stopOnEntry = stop
+	}
 	depth, ok := request.Arguments["stackTraceDepth"].(float64)
 	if ok && depth > 0 {
 		s.args.stackTraceDepth = int(depth)
+	}
+	globals, ok := request.Arguments["showGlobalVariables"].(bool)
+	if ok {
+		s.args.showGlobalVariables = globals
 	}
 
 	var targetArgs []string
@@ -527,27 +536,57 @@ func (s *Server) onDisconnectRequest(request *dap.DisconnectRequest) {
 }
 
 func (s *Server) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
+	// TODO(polina): handle this while running by halting first.
+
 	if request.Arguments.Source.Path == "" {
-		s.log.Error("ERROR: Unable to set breakpoint for empty file path")
+		s.sendErrorResponse(request.Request, UnableToSetBreakpoints, "Unable to set or clear breakpoints", "empty file path")
+		return
 	}
-	response := &dap.SetBreakpointsResponse{Response: *newResponse(request.Request)}
-	response.Body.Breakpoints = make([]dap.Breakpoint, len(request.Arguments.Breakpoints))
-	// Only verified breakpoints will be set and reported back in the
-	// response. All breakpoints resulting in errors (e.g. duplicates
-	// or lines that do not have statements) will be skipped.
-	i := 0
-	for _, b := range request.Arguments.Breakpoints {
-		bp, err := s.debugger.CreateBreakpoint(
-			&api.Breakpoint{File: request.Arguments.Source.Path, Line: b.Line})
-		if err != nil {
-			s.log.Error("ERROR:", err)
+
+	// According to the spec we should "set multiple breakpoints for a single source
+	// and clear all previous breakpoints in that source." The simplest way is
+	// to clear all and then set all.
+	//
+	// TODO(polina): should we optimize this as follows?
+	// See https://github.com/golang/vscode-go/issues/163 for details.
+	// If a breakpoint:
+	// -- exists and not in request => ClearBreakpoint
+	// -- exists and in request => AmendBreakpoint
+	// -- doesn't exist and in request => SetBreakpoint
+
+	// Clear all existing breakpoints in the file.
+	existing := s.debugger.Breakpoints()
+	for _, bp := range existing {
+		// Skip special breakpoints such as for panic.
+		if bp.ID < 0 {
 			continue
 		}
-		response.Body.Breakpoints[i].Verified = true
-		response.Body.Breakpoints[i].Line = bp.Line
-		i++
+		// Skip other source files.
+		// TODO(polina): should this be normalized because of different OSes?
+		if bp.File != request.Arguments.Source.Path {
+			continue
+		}
+		_, err := s.debugger.ClearBreakpoint(bp)
+		if err != nil {
+			s.sendErrorResponse(request.Request, UnableToSetBreakpoints, "Unable to set or clear breakpoints", err.Error())
+			return
+		}
 	}
-	response.Body.Breakpoints = response.Body.Breakpoints[:i]
+
+	// Set all requested breakpoints.
+	response := &dap.SetBreakpointsResponse{Response: *newResponse(request.Request)}
+	response.Body.Breakpoints = make([]dap.Breakpoint, len(request.Arguments.Breakpoints))
+	for i, want := range request.Arguments.Breakpoints {
+		got, err := s.debugger.CreateBreakpoint(
+			&api.Breakpoint{File: request.Arguments.Source.Path, Line: want.Line, Cond: want.Condition})
+		response.Body.Breakpoints[i].Verified = (err == nil)
+		if err != nil {
+			response.Body.Breakpoints[i].Line = want.Line
+			response.Body.Breakpoints[i].Message = err.Error()
+		} else {
+			response.Body.Breakpoints[i].Line = got.Line
+		}
+	}
 	s.send(response)
 }
 
@@ -567,13 +606,15 @@ func (s *Server) onConfigurationDoneRequest(request *dap.ConfigurationDoneReques
 	}
 	s.send(&dap.ConfigurationDoneResponse{Response: *newResponse(request.Request)})
 	if !s.args.stopOnEntry {
-		s.doContinue()
+		s.doCommand(api.Continue)
 	}
 }
 
 func (s *Server) onContinueRequest(request *dap.ContinueRequest) {
-	s.send(&dap.ContinueResponse{Response: *newResponse(request.Request)})
-	s.doContinue()
+	s.send(&dap.ContinueResponse{
+		Response: *newResponse(request.Request),
+		Body:     dap.ContinueResponseBody{AllThreadsContinued: true}})
+	s.doCommand(api.Continue)
 }
 
 func (s *Server) onThreadsRequest(request *dap.ThreadsRequest) {
@@ -594,6 +635,9 @@ func (s *Server) onThreadsRequest(request *dap.ThreadsRequest) {
 		return
 	}
 
+	s.debugger.LockTarget()
+	defer s.debugger.UnlockTarget()
+
 	threads := make([]dap.Thread, len(gs))
 	if len(threads) == 0 {
 		// Depending on the debug session stage, goroutines information
@@ -605,8 +649,9 @@ func (s *Server) onThreadsRequest(request *dap.ThreadsRequest) {
 	} else {
 		for i, g := range gs {
 			threads[i].Id = g.ID
-			if loc := g.UserCurrentLoc; loc.Function != nil {
-				threads[i].Name = loc.Function.Name()
+			loc := g.UserCurrent()
+			if loc.Fn != nil {
+				threads[i].Name = loc.Fn.Name
 			} else {
 				threads[i].Name = fmt.Sprintf("%s@%d", loc.File, loc.Line)
 			}
@@ -625,22 +670,31 @@ func (s *Server) onAttachRequest(request *dap.AttachRequest) { // TODO V0
 	s.sendNotYetImplementedErrorResponse(request.Request)
 }
 
-// onNextRequest sends a not-yet-implemented error response.
+// onNextRequest handles 'next' request.
 // This is a mandatory request to support.
-func (s *Server) onNextRequest(request *dap.NextRequest) { // TODO V0
-	s.sendNotYetImplementedErrorResponse(request.Request)
+func (s *Server) onNextRequest(request *dap.NextRequest) {
+	// This ingores threadId argument to match the original vscode-go implementation.
+	// TODO(polina): use SwitchGoroutine to change the current goroutine.
+	s.send(&dap.NextResponse{Response: *newResponse(request.Request)})
+	s.doCommand(api.Next)
 }
 
-// onStepInRequest sends a not-yet-implemented error response.
+// onStepInRequest handles 'stepIn' request
 // This is a mandatory request to support.
-func (s *Server) onStepInRequest(request *dap.StepInRequest) { // TODO V0
-	s.sendNotYetImplementedErrorResponse(request.Request)
+func (s *Server) onStepInRequest(request *dap.StepInRequest) {
+	// This ingores threadId argument to match the original vscode-go implementation.
+	// TODO(polina): use SwitchGoroutine to change the current goroutine.
+	s.send(&dap.StepInResponse{Response: *newResponse(request.Request)})
+	s.doCommand(api.Step)
 }
 
-// onStepOutRequest sends a not-yet-implemented error response.
+// onStepOutRequest handles 'stepOut' request
 // This is a mandatory request to support.
-func (s *Server) onStepOutRequest(request *dap.StepOutRequest) { // TODO V0
-	s.sendNotYetImplementedErrorResponse(request.Request)
+func (s *Server) onStepOutRequest(request *dap.StepOutRequest) {
+	// This ingores threadId argument to match the original vscode-go implementation.
+	// TODO(polina): use SwitchGoroutine to change the current goroutine.
+	s.send(&dap.StepOutResponse{Response: *newResponse(request.Request)})
+	s.doCommand(api.StepOut)
 }
 
 // onPauseRequest sends a not-yet-implemented error response.
@@ -660,17 +714,22 @@ type stackFrame struct {
 // This is a mandatory request to support.
 func (s *Server) onStackTraceRequest(request *dap.StackTraceRequest) {
 	goroutineID := request.Arguments.ThreadId
-	locs, err := s.debugger.Stacktrace(goroutineID, s.args.stackTraceDepth, 0, nil /*skip locals & args*/)
+	frames, err := s.debugger.Stacktrace(goroutineID, s.args.stackTraceDepth, 0)
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToProduceStackTrace, "Unable to produce stack trace", err.Error())
 		return
 	}
 
-	stackFrames := make([]dap.StackFrame, len(locs))
-	for i, loc := range locs {
+	stackFrames := make([]dap.StackFrame, len(frames))
+	for i, frame := range frames {
+		loc := &frame.Call
 		uniqueStackFrameID := s.stackFrameHandles.create(stackFrame{goroutineID, i})
 		stackFrames[i] = dap.StackFrame{Id: uniqueStackFrameID, Line: loc.Line}
-		stackFrames[i].Name = loc.Function.Name()
+		if loc.Fn == nil {
+			stackFrames[i].Name = "???"
+		} else {
+			stackFrames[i].Name = loc.Fn.Name
+		}
 		if loc.File != "<autogenerated>" {
 			stackFrames[i].Source = dap.Source{Name: filepath.Base(loc.File), Path: loc.File}
 		}
@@ -684,7 +743,7 @@ func (s *Server) onStackTraceRequest(request *dap.StackTraceRequest) {
 	}
 	response := &dap.StackTraceResponse{
 		Response: *newResponse(request.Request),
-		Body:     dap.StackTraceResponseBody{StackFrames: stackFrames, TotalFrames: len(locs)},
+		Body:     dap.StackTraceResponseBody{StackFrames: stackFrames, TotalFrames: len(frames)},
 	}
 	s.send(response)
 }
@@ -698,33 +757,67 @@ func (s *Server) onScopesRequest(request *dap.ScopesRequest) {
 		return
 	}
 
-	scope := api.EvalScope{GoroutineID: sf.(stackFrame).goroutineID, Frame: sf.(stackFrame).frameIndex}
+	goid := sf.(stackFrame).goroutineID
+	frame := sf.(stackFrame).frameIndex
 	// TODO(polina): Support setting config via launch/attach args
 	cfg := proc.LoadConfig{FollowPointers: true, MaxVariableRecurse: 1, MaxStringLen: 64, MaxArrayValues: 64, MaxStructFields: -1}
 
 	// Retrieve arguments
-	args, err := s.debugger.FunctionArguments(scope, cfg)
+	args, err := s.debugger.FunctionArguments(goid, frame, 0, cfg)
 	if err != nil {
 		s.sendErrorResponse(request.Request, UnableToListArgs, "Unable to list args", err.Error())
 		return
 	}
-	argScope := api.Variable{Name: "Arguments", Children: args}
+	argScope := &proc.Variable{Name: "Arguments", Children: slicePtrVarToSliceVar(args)}
 
 	// Retrieve local variables
-	locals, err := s.debugger.LocalVariables(scope, cfg)
+	locals, err := s.debugger.LocalVariables(goid, frame, 0, cfg)
 	if err != nil {
-		s.sendErrorResponse(request.Request, UnableToListLocals, "Unable to list local vars", err.Error())
+		s.sendErrorResponse(request.Request, UnableToListLocals, "Unable to list locals", err.Error())
 		return
 	}
-	locScope := api.Variable{Name: "Locals", Children: locals}
+	locScope := &proc.Variable{Name: "Locals", Children: slicePtrVarToSliceVar(locals)}
 
 	// TODO(polina): Annotate shadowed variables
-	// TODO(polina): Retrieve global variables
 
 	scopeArgs := dap.Scope{Name: argScope.Name, VariablesReference: s.variableHandles.create(argScope)}
 	scopeLocals := dap.Scope{Name: locScope.Name, VariablesReference: s.variableHandles.create(locScope)}
 	scopes := []dap.Scope{scopeArgs, scopeLocals}
 
+	if s.args.showGlobalVariables {
+		// Limit what global variables we will return to the current package only.
+		// TODO(polina): This is how vscode-go currently does it to make
+		// the amount of the returned data manageable. In fact, this is
+		// considered so expensive even with the package filter, that
+		// the default for showGlobalVariables was recently flipped to
+		// not showing. If we delay loading of the globals until the corresponding
+		// scope is expanded, generating an explicit variable request,
+		// should we consider making all globals accessible with a scope per package?
+		// Or users can just rely on watch variables.
+		currPkg, err := s.debugger.CurrentPackage()
+		if err != nil {
+			s.sendErrorResponse(request.Request, UnableToListGlobals, "Unable to list globals", err.Error())
+			return
+		}
+		currPkgFilter := fmt.Sprintf("^%s\\.", currPkg)
+		globals, err := s.debugger.PackageVariables(currPkgFilter, cfg)
+		if err != nil {
+			s.sendErrorResponse(request.Request, UnableToListGlobals, "Unable to list globals", err.Error())
+			return
+		}
+		// Remove package prefix from the fully-qualified variable names.
+		// We will include the package info once in the name of the scope instead.
+		for i, g := range globals {
+			globals[i].Name = strings.TrimPrefix(g.Name, currPkg+".")
+		}
+
+		globScope := &proc.Variable{
+			Name:     fmt.Sprintf("Globals (package %s)", currPkg),
+			Children: slicePtrVarToSliceVar(globals),
+		}
+		scopeGlobals := dap.Scope{Name: globScope.Name, VariablesReference: s.variableHandles.create(globScope)}
+		scopes = append(scopes, scopeGlobals)
+	}
 	response := &dap.ScopesResponse{
 		Response: *newResponse(request.Request),
 		Body:     dap.ScopesResponseBody{Scopes: scopes},
@@ -732,15 +825,22 @@ func (s *Server) onScopesRequest(request *dap.ScopesRequest) {
 	s.send(response)
 }
 
+func slicePtrVarToSliceVar(vars []*proc.Variable) []proc.Variable {
+	r := make([]proc.Variable, len(vars))
+	for i := range vars {
+		r[i] = *vars[i]
+	}
+	return r
+}
+
 // onVariablesRequest handles 'variables' requests.
 // This is a mandatory request to support.
 func (s *Server) onVariablesRequest(request *dap.VariablesRequest) {
-	variable, ok := s.variableHandles.get(request.Arguments.VariablesReference)
+	v, ok := s.variableHandles.get(request.Arguments.VariablesReference)
 	if !ok {
 		s.sendErrorResponse(request.Request, UnableToLookupVariable, "Unable to lookup variable", fmt.Sprintf("unknown reference %d", request.Arguments.VariablesReference))
 		return
 	}
-	v := variable.(api.Variable)
 	children := make([]dap.Variable, 0)
 	// TODO(polina): check and handle if variable loaded incompletely
 	// https://github.com/go-delve/delve/blob/master/Documentation/api/ClientHowto.md#looking-into-variables
@@ -751,8 +851,8 @@ func (s *Server) onVariablesRequest(request *dap.VariablesRequest) {
 			// A map will have twice as many children as there are key-value elements.
 			kvIndex := i / 2
 			// Process children in pairs: even indices are map keys, odd indices are values.
-			key, keyref := s.convertVariable(v.Children[i])
-			val, valref := s.convertVariable(v.Children[i+1])
+			key, keyref := s.convertVariable(&v.Children[i])
+			val, valref := s.convertVariable(&v.Children[i+1])
 			// If key or value or both are scalars, we can use
 			// a single variable to represet key:value format.
 			// Otherwise, we must return separate variables for both.
@@ -784,7 +884,8 @@ func (s *Server) onVariablesRequest(request *dap.VariablesRequest) {
 		}
 	case reflect.Slice, reflect.Array:
 		children = make([]dap.Variable, len(v.Children))
-		for i, c := range v.Children {
+		for i := range v.Children {
+			c := &v.Children[i]
 			value, varref := s.convertVariable(c)
 			children[i] = dap.Variable{
 				Name:               fmt.Sprintf("[%d]", i),
@@ -794,7 +895,8 @@ func (s *Server) onVariablesRequest(request *dap.VariablesRequest) {
 		}
 	default:
 		children = make([]dap.Variable, len(v.Children))
-		for i, c := range v.Children {
+		for i := range v.Children {
+			c := &v.Children[i]
 			value, variablesReference := s.convertVariable(c)
 			children[i] = dap.Variable{
 				Name:               c.Name,
@@ -819,11 +921,12 @@ func (s *Server) onVariablesRequest(request *dap.VariablesRequest) {
 // can be issued to get the elements of the compound variable. As a custom, a zero
 // reference, reminiscent of a zero pointer, is used to indicate that a scalar
 // variable cannot be "dereferenced" to get its elements (as there are none).
-func (s *Server) convertVariable(v api.Variable) (value string, variablesReference int) {
-	if v.Unreadable != "" {
-		value = fmt.Sprintf("unreadable <%s>", v.Unreadable)
+func (s *Server) convertVariable(v *proc.Variable) (value string, variablesReference int) {
+	if v.Unreadable != nil {
+		value = fmt.Sprintf("unreadable <%v>", v.Unreadable)
 		return
 	}
+	typeName := api.PrettyTypeName(v.DwarfType)
 	switch v.Kind {
 	case reflect.UnsafePointer:
 		if len(v.Children) == 0 {
@@ -832,65 +935,101 @@ func (s *Server) convertVariable(v api.Variable) (value string, variablesReferen
 			value = fmt.Sprintf("unsafe.Pointer(%#x)", v.Children[0].Addr)
 		}
 	case reflect.Ptr:
-		if v.Type == "" || len(v.Children) == 0 {
+		if v.DwarfType == nil || len(v.Children) == 0 {
 			value = "nil"
 		} else if v.Children[0].Addr == 0 {
-			value = "nil <" + v.Type + ">"
-		} else if v.Children[0].Type == "void" {
+			value = "nil <" + typeName + ">"
+		} else if v.Children[0].Kind == reflect.Invalid {
 			value = "void"
 		} else {
-			value = fmt.Sprintf("<%s>(%#x)", v.Type, v.Children[0].Addr)
+			value = fmt.Sprintf("<%s>(%#x)", typeName, v.Children[0].Addr)
 			variablesReference = s.variableHandles.create(v)
 		}
 	case reflect.Array:
-		value = "<" + v.Type + ">"
+		value = "<" + typeName + ">"
 		if len(v.Children) > 0 {
 			variablesReference = s.variableHandles.create(v)
 		}
 	case reflect.Slice:
 		if v.Base == 0 {
-			value = "nil <" + v.Type + ">"
+			value = "nil <" + typeName + ">"
 		} else {
-			value = fmt.Sprintf("<%s> (length: %d, cap: %d)", v.Type, v.Len, v.Cap)
+			value = fmt.Sprintf("<%s> (length: %d, cap: %d)", typeName, v.Len, v.Cap)
 			if len(v.Children) > 0 {
 				variablesReference = s.variableHandles.create(v)
 			}
 		}
 	case reflect.Map:
 		if v.Base == 0 {
-			value = "nil <" + v.Type + ">"
+			value = "nil <" + typeName + ">"
 		} else {
-			value = fmt.Sprintf("<%s> (length: %d)", v.Type, v.Len)
+			value = fmt.Sprintf("<%s> (length: %d)", typeName, v.Len)
 			if len(v.Children) > 0 {
 				variablesReference = s.variableHandles.create(v)
 			}
 		}
 	case reflect.String:
-		lenNotLoaded := v.Len - int64(len(v.Value))
-		vvalue := v.Value
+		vvalue := constant.StringVal(v.Value)
+		lenNotLoaded := v.Len - int64(len(vvalue))
 		if lenNotLoaded > 0 {
 			vvalue += fmt.Sprintf("...+%d more", lenNotLoaded)
 		}
 		value = fmt.Sprintf("%q", vvalue)
 	case reflect.Chan:
 		if len(v.Children) == 0 {
-			value = "nil <" + v.Type + ">"
+			value = "nil <" + typeName + ">"
 		} else {
-			value = "<" + v.Type + ">"
+			value = "<" + typeName + ">"
 			variablesReference = s.variableHandles.create(v)
 		}
 	case reflect.Interface:
-		if len(v.Children) == 0 || v.Children[0].Kind == reflect.Invalid && v.Children[0].Addr == 0 {
-			value = "nil <" + v.Type + ">"
+		if v.Addr == 0 {
+			// An escaped interface variable that points to nil, this shouldn't
+			// happen in normal code but can happen if the variable is out of scope,
+			// such as if an interface variable has been captured by a
+			// closure and replaced by a pointer to interface, and the pointer
+			// happens to contain 0.
+			value = "nil"
+		} else if len(v.Children) == 0 || v.Children[0].Kind == reflect.Invalid && v.Children[0].Addr == 0 {
+			value = "nil <" + typeName + ">"
 		} else {
-			value = "<" + v.Type + ">"
+			value = "<" + typeName + "(" + v.Children[0].TypeString() + ")" + ">"
+			// TODO(polina): should we remove one level of indirection and skip "data"?
+			// Then we will have:
+			// Before:
+			//   i: <interface{}(int)>
+			//      data: 123
+			// After:
+			//   i: <interface{}(int)> 123
+			// Before:
+			//   i: <interface{}(main.MyStruct)>
+			//      data: <main.MyStruct>
+			//         field1: ...
+			// After:
+			//   i: <interface{}(main.MyStruct)>
+			//      field1: ...
 			variablesReference = s.variableHandles.create(v)
 		}
-	default: // Struct, complex, scalar
-		if v.Value != "" {
-			value = v.Value
+	case reflect.Complex64, reflect.Complex128:
+		v.Children = make([]proc.Variable, 2)
+		v.Children[0].Name = "real"
+		v.Children[0].Value = constant.Real(v.Value)
+		v.Children[1].Name = "imaginary"
+		v.Children[1].Value = constant.Imag(v.Value)
+		if v.Kind == reflect.Complex64 {
+			v.Children[0].Kind = reflect.Float32
+			v.Children[1].Kind = reflect.Float32
 		} else {
-			value = "<" + v.Type + ">"
+			v.Children[0].Kind = reflect.Float64
+			v.Children[1].Kind = reflect.Float64
+		}
+		fallthrough
+	default: // Struct, complex, scalar
+		vvalue := api.VariableValueAsString(v)
+		if vvalue != "" {
+			value = vvalue
+		} else {
+			value = "<" + typeName + ">"
 		}
 		if len(v.Children) > 0 {
 			variablesReference = s.variableHandles.create(v)
@@ -1031,32 +1170,75 @@ func newEvent(event string) *dap.Event {
 	}
 }
 
-func (s *Server) doContinue() {
+const BetterBadAccessError = `invalid memory address or nil pointer dereference [signal SIGSEGV: segmentation violation]
+Unable to propogate EXC_BAD_ACCESS signal to target process and panic (see https://github.com/go-delve/delve/issues/852)`
+
+// doCommand runs a debugger command until it stops on
+// termination, error, breakpoint, etc, when an appropriate
+// event needs to be sent to the client.
+func (s *Server) doCommand(command string) {
 	if s.debugger == nil {
 		return
 	}
-	state, err := s.debugger.Command(&api.DebuggerCommand{Name: api.Continue})
-	if err != nil {
-		s.log.Error(err)
-		switch err.(type) {
-		case proc.ErrProcessExited:
-			e := &dap.TerminatedEvent{Event: *newEvent("terminated")}
-			s.send(e)
-		default:
-		}
-		return
-	}
-	s.stackFrameHandles.reset()
-	s.variableHandles.reset()
-	if state.Exited {
+
+	state, err := s.debugger.Command(&api.DebuggerCommand{Name: command})
+	if _, isexited := err.(proc.ErrProcessExited); isexited || err == nil && state.Exited {
 		e := &dap.TerminatedEvent{Event: *newEvent("terminated")}
 		s.send(e)
+		return
+	}
+
+	s.stackFrameHandles.reset()
+	s.variableHandles.reset()
+
+	stopped := &dap.StoppedEvent{Event: *newEvent("stopped")}
+	stopped.Body.AllThreadsStopped = true
+
+	if err == nil {
+		if state.SelectedGoroutine != nil {
+			stopped.Body.ThreadId = state.SelectedGoroutine.ID
+		}
+
+		switch s.debugger.StopReason() {
+		case proc.StopNextFinished:
+			stopped.Body.Reason = "step"
+		default:
+			stopped.Body.Reason = "breakpoint"
+		}
+		if state.CurrentThread.Breakpoint != nil {
+			switch state.CurrentThread.Breakpoint.Name {
+			case proc.FatalThrow:
+				stopped.Body.Reason = "fatal error"
+			case proc.UnrecoveredPanic:
+				stopped.Body.Reason = "panic"
+			}
+		}
+		s.send(stopped)
 	} else {
-		e := &dap.StoppedEvent{Event: *newEvent("stopped")}
-		// TODO(polina): differentiate between breakpoint and pause on halt.
-		e.Body.Reason = "breakpoint"
-		e.Body.AllThreadsStopped = true
-		e.Body.ThreadId = state.SelectedGoroutine.ID
-		s.send(e)
+		s.log.Error("runtime error: ", err)
+		stopped.Body.Reason = "runtime error"
+		stopped.Body.Text = err.Error()
+		// Special case in the spirit of https://github.com/microsoft/vscode-go/issues/1903
+		if stopped.Body.Text == "bad access" {
+			stopped.Body.Text = BetterBadAccessError
+		}
+		state, err := s.debugger.State( /*nowait*/ true)
+		if err == nil {
+			stopped.Body.ThreadId = state.CurrentThread.GoroutineID
+		}
+		s.send(stopped)
+
+		// TODO(polina): according to the spec, the extra 'text' is supposed to show up in the UI (e.g. on hover),
+		// but so far I am unable to get this to work in vscode - see https://github.com/microsoft/vscode/issues/104475.
+		// Options to explore:
+		//   - supporting ExceptionInfo request
+		//   - virtual variable scope for Exception that shows the message (details here: https://github.com/microsoft/vscode/issues/3101)
+		// In the meantime, provide the extra details by outputing an error message.
+		s.send(&dap.OutputEvent{
+			Event: *newEvent("output"),
+			Body: dap.OutputEventBody{
+				Output:   fmt.Sprintf("ERROR: %s\n", stopped.Body.Text),
+				Category: "stderr",
+			}})
 	}
 }
