@@ -128,6 +128,8 @@ type Thread struct {
 
 	// ReturnValues contains the return values of the function we just stepped out of
 	ReturnValues []Variable
+	// CallReturn is true if ReturnValues are the return values of an injected call.
+	CallReturn bool
 }
 
 // Location holds program location information.
@@ -312,6 +314,8 @@ type Goroutine struct {
 	StartLoc Location `json:"startLoc"`
 	// ID of the associated thread for running goroutines
 	ThreadID   int    `json:"threadID"`
+	WaitSince  int64  `json:"waitSince"`
+	WaitReason int64  `json:"waitReason"`
 	Unreadable string `json:"unreadable"`
 	// Goroutine's pprof labels
 	Labels map[string]string `json:"labels,omitempty"`

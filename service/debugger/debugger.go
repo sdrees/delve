@@ -381,9 +381,8 @@ func (d *Debugger) FunctionReturnLocations(fnName string) ([]uint64, error) {
 	}
 
 	var regs proc.Registers
-	var mem proc.MemoryReadWriter = p.CurrentThread()
+	mem := p.Memory()
 	if g != nil && g.Thread != nil {
-		mem = g.Thread
 		regs, _ = g.Thread.Registers()
 	}
 	instructions, err := proc.Disassemble(mem, regs, p.Breakpoints(), p.BinInfo(), fn.Entry, fn.End)
@@ -408,7 +407,9 @@ func (d *Debugger) FunctionReturnLocations(fnName string) ([]uint64, error) {
 func (d *Debugger) Detach(kill bool) error {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
-
+	if ok, _ := d.target.Valid(); !ok {
+		return nil
+	}
 	return d.detach(kill)
 }
 
@@ -563,6 +564,7 @@ func (d *Debugger) state(retLoadCfg *proc.LoadConfig) (*api.DebuggerState, error
 	for _, thread := range d.target.ThreadList() {
 		th := api.ConvertThread(thread)
 
+		th.CallReturn = thread.Common().CallReturn
 		if retLoadCfg != nil {
 			th.ReturnValues = api.ConvertVars(thread.Common().ReturnValues(*retLoadCfg))
 		}
@@ -1374,7 +1376,7 @@ func (d *Debugger) convertStacktrace(rawlocs []proc.Stackframe, cfg *proc.LoadCo
 		}
 		if cfg != nil && rawlocs[i].Current.Fn != nil {
 			var err error
-			scope := proc.FrameToScope(d.target.BinInfo(), d.target.CurrentThread(), nil, rawlocs[i:]...)
+			scope := proc.FrameToScope(d.target.BinInfo(), d.target.Memory(), nil, rawlocs[i:]...)
 			locals, err := scope.LocalVariables(*cfg)
 			if err != nil {
 				return nil, err
@@ -1444,7 +1446,7 @@ func (d *Debugger) CurrentPackage() (string, error) {
 }
 
 // FindLocation will find the location specified by 'locStr'.
-func (d *Debugger) FindLocation(goid, frame, deferredCall int, locStr string, includeNonExecutableLines bool) ([]api.Location, error) {
+func (d *Debugger) FindLocation(goid, frame, deferredCall int, locStr string, includeNonExecutableLines bool, substitutePathRules [][2]string) ([]api.Location, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
@@ -1459,7 +1461,7 @@ func (d *Debugger) FindLocation(goid, frame, deferredCall int, locStr string, in
 
 	s, _ := proc.ConvertEvalScope(d.target, goid, frame, deferredCall)
 
-	locs, err := loc.Find(d.target, d.processArgs, s, locStr, includeNonExecutableLines)
+	locs, err := loc.Find(d.target, d.processArgs, s, locStr, includeNonExecutableLines, substitutePathRules)
 	for i := range locs {
 		if locs[i].PC == 0 {
 			continue
@@ -1502,7 +1504,7 @@ func (d *Debugger) Disassemble(goroutineID int, addr1, addr2 uint64) ([]proc.Asm
 	}
 	regs, _ := curthread.Registers()
 
-	return proc.Disassemble(curthread, regs, d.target.Breakpoints(), d.target.BinInfo(), addr1, addr2)
+	return proc.Disassemble(d.target.Memory(), regs, d.target.Breakpoints(), d.target.BinInfo(), addr1, addr2)
 }
 
 func (d *Debugger) AsmInstructionText(inst *proc.AsmInstruction, flavour proc.AssemblyFlavour) string {
@@ -1516,6 +1518,24 @@ func (d *Debugger) Recorded() (recorded bool, tracedir string) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 	return d.target.Recorded()
+}
+
+// FindThreadReturnValues returns the return values of the function that
+// the thread of the given 'id' just stepped out of.
+func (d *Debugger) FindThreadReturnValues(id int, cfg proc.LoadConfig) ([]*proc.Variable, error) {
+	d.targetMutex.Lock()
+	defer d.targetMutex.Unlock()
+
+	if _, err := d.target.Valid(); err != nil {
+		return nil, err
+	}
+
+	thread, found := d.target.FindThread(id)
+	if !found {
+		return nil, fmt.Errorf("could not find thread %d", id)
+	}
+
+	return thread.Common().ReturnValues(cfg), nil
 }
 
 // Checkpoint will set a checkpoint specified by the locspec.
@@ -1554,9 +1574,9 @@ func (d *Debugger) ExamineMemory(address uint64, length int) ([]byte, error) {
 	d.targetMutex.Lock()
 	defer d.targetMutex.Unlock()
 
-	thread := d.target.CurrentThread()
+	mem := d.target.Memory()
 	data := make([]byte, length)
-	n, err := thread.ReadMemory(data, address)
+	n, err := mem.ReadMemory(data, address)
 	if err != nil {
 		return nil, err
 	}

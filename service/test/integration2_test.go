@@ -9,6 +9,7 @@ import (
 	"net/rpc"
 	"net/rpc/jsonrpc"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -766,6 +767,23 @@ func TestClientServer_FindLocations(t *testing.T) {
 		findLocationHelper(t, c, "-1", false, 1, findLocationHelper(t, c, "locationsprog.go:33", false, 1, 0)[0])
 
 		findLocationHelper(t, c, `*amap["k"]`, false, 1, findLocationHelper(t, c, `amap["k"]`, false, 1, 0)[0])
+
+		locsNoSubst, _ := c.FindLocation(api.EvalScope{GoroutineID: -1}, "_fixtures/locationsprog.go:35", false, nil)
+		sep := "/"
+		if strings.Contains(locsNoSubst[0].File, "\\") {
+			sep = "\\"
+		}
+		substRules := [][2]string{[2]string{strings.Replace(locsNoSubst[0].File, "locationsprog.go", "", 1), strings.Replace(locsNoSubst[0].File, "_fixtures"+sep+"locationsprog.go", "nonexistent", 1)}}
+		t.Logf("substitute rules: %q -> %q", substRules[0][0], substRules[0][1])
+		locsSubst, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "nonexistent/locationsprog.go:35", false, substRules)
+		if err != nil {
+			t.Fatalf("FindLocation(locationsprog.go:35) with substitute rules: %v", err)
+		}
+		t.Logf("FindLocation(\"/nonexistent/path/locationsprog.go:35\") -> %#v", locsSubst)
+		if locsNoSubst[0].PC != locsSubst[0].PC {
+			t.Fatalf("FindLocation with substitute rules mismatch %#v %#v", locsNoSubst[0], locsSubst[0])
+		}
+
 	})
 
 	withTestClient2("testnextdefer", t, func(c service.Client) {
@@ -928,23 +946,9 @@ func TestClientServer_FullStacktrace(t *testing.T) {
 			}
 		}
 
-		firsterr := false
-		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
-			// We try to make sure that all goroutines are stopped at a sensible place
-			// before reading their stacktrace, but due to the nature of the test
-			// program there is no guarantee that we always find them in a reasonable
-			// state.
-			// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
-			// unnecessary flakiness allow a single goroutine to be in a bad state.
-			firsterr = true
-		}
 		for i := range found {
 			if !found[i] {
-				if firsterr {
-					firsterr = false
-				} else {
-					t.Fatalf("Goroutine %d not found", i)
-				}
+				t.Fatalf("Goroutine %d not found", i)
 			}
 		}
 
@@ -1036,7 +1040,7 @@ func TestIssue355(t *testing.T) {
 		assertError(err, t, "ListGoroutines()")
 		_, err = c.Stacktrace(gid, 10, 0, &normalLoadConfig)
 		assertError(err, t, "Stacktrace()")
-		_, err = c.FindLocation(api.EvalScope{GoroutineID: gid}, "+1", false)
+		_, err = c.FindLocation(api.EvalScope{GoroutineID: gid}, "+1", false, nil)
 		assertError(err, t, "FindLocation()")
 		_, err = c.DisassemblePC(api.EvalScope{GoroutineID: -1}, 0x40100, api.IntelFlavour)
 		assertError(err, t, "DisassemblePC()")
@@ -1053,7 +1057,7 @@ func TestDisasm(t *testing.T) {
 		state := <-ch
 		assertNoError(state.Err, t, "Continue()")
 
-		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main", false)
+		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main", false, nil)
 		assertNoError(err, t, "FindLocation()")
 		if len(locs) != 1 {
 			t.Fatalf("wrong number of locations for main.main: %d", len(locs))
@@ -1315,7 +1319,7 @@ func TestTypesCommand(t *testing.T) {
 func TestIssue406(t *testing.T) {
 	protest.AllowRecording(t)
 	withTestClient2("issue406", t, func(c service.Client) {
-		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "issue406.go:146", false)
+		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "issue406.go:146", false, nil)
 		assertNoError(err, t, "FindLocation()")
 		_, err = c.CreateBreakpoint(&api.Breakpoint{Addr: locs[0].PC})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -1723,16 +1727,13 @@ func TestAcceptMulticlient(t *testing.T) {
 }
 
 func mustHaveDebugCalls(t *testing.T, c service.Client) {
-	locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "runtime.debugCallV1", false)
+	locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "runtime.debugCallV1", false, nil)
 	if len(locs) == 0 || err != nil {
 		t.Skip("function calls not supported on this version of go")
 	}
 }
 
 func TestClientServerFunctionCall(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support FunctionCall for now")
-	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 	withTestClient2("fncall", t, func(c service.Client) {
 		mustHaveDebugCalls(t, c)
@@ -1764,16 +1765,13 @@ func TestClientServerFunctionCall(t *testing.T) {
 }
 
 func TestClientServerFunctionCallBadPos(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support FunctionCall for now")
-	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 12) {
 		t.Skip("this is a safe point for Go 1.12")
 	}
 	withTestClient2("fncall", t, func(c service.Client) {
 		mustHaveDebugCalls(t, c)
-		loc, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "fmt/print.go:649", false)
+		loc, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "fmt/print.go:649", false, nil)
 		assertNoError(err, t, "could not find location")
 
 		_, err = c.CreateBreakpoint(&api.Breakpoint{File: loc[0].File, Line: loc[0].Line})
@@ -1794,9 +1792,6 @@ func TestClientServerFunctionCallBadPos(t *testing.T) {
 }
 
 func TestClientServerFunctionCallPanic(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support FunctionCall for now")
-	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 	withTestClient2("fncall", t, func(c service.Client) {
 		mustHaveDebugCalls(t, c)
@@ -1823,9 +1818,6 @@ func TestClientServerFunctionCallPanic(t *testing.T) {
 }
 
 func TestClientServerFunctionCallStacktrace(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support FunctionCall for now")
-	}
 	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 15) {
 		t.Skip("Go 1.15 executes function calls in a different goroutine so the stack trace will not contain main.main or runtime.main")
 	}
@@ -1916,7 +1908,7 @@ func TestUnknownMethodCall(t *testing.T) {
 func TestIssue1703(t *testing.T) {
 	// Calling Disassemble when there is no current goroutine should work.
 	withTestClient2("testnextprog", t, func(c service.Client) {
-		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main", true)
+		locs, err := c.FindLocation(api.EvalScope{GoroutineID: -1}, "main.main", true, nil)
 		assertNoError(err, t, "FindLocation")
 		t.Logf("FindLocation: %#v", locs)
 		text, err := c.DisassemblePC(api.EvalScope{GoroutineID: -1}, locs[0].PC, api.IntelFlavour)
@@ -2104,14 +2096,71 @@ func TestIssue2162(t *testing.T) {
 		t.Skip("skip it for stepping into one place where no source for pc when on pie mode or windows")
 	}
 	withTestClient2("issue2162", t, func(c service.Client) {
-		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main"})
+		state, err := c.GetState()
+		assertNoError(err, t, "GetState()")
+		if state.CurrentThread.Function == nil {
+			// Can't call Step if we don't have the source code of the current function
+			return
+		}
+
+		_, err = c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main"})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
 		_, err = c.Step()
-		if err != nil {
-			assertNoError(err, t, "Step()")
-		}
+		assertNoError(err, t, "Step()")
 	})
+}
+
+func TestDetachLeaveRunning(t *testing.T) {
+	// See https://github.com/go-delve/delve/issues/2259
+	if testBackend == "rr" {
+		return
+	}
+
+	listener, clientConn := service.ListenerPipe()
+	defer listener.Close()
+	var buildFlags protest.BuildFlags
+	if buildMode == "pie" {
+		buildFlags |= protest.BuildModePIE
+	}
+	fixture := protest.BuildFixture("testnextnethttp", buildFlags)
+
+	cmd := exec.Command(fixture.Path)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	assertNoError(cmd.Start(), t, "starting fixture")
+	defer cmd.Process.Kill()
+
+	// wait for testnextnethttp to start listening
+	t0 := time.Now()
+	for {
+		conn, err := net.Dial("tcp", "127.0.0.1:9191")
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+		if time.Since(t0) > 10*time.Second {
+			t.Fatal("fixture did not start")
+		}
+	}
+
+	server := rpccommon.NewServer(&service.Config{
+		Listener:   listener,
+		APIVersion: 2,
+		Debugger: debugger.Config{
+			AttachPid:  cmd.Process.Pid,
+			WorkingDir: ".",
+			Backend:    testBackend,
+		},
+	})
+	if err := server.Run(); err != nil {
+		t.Fatal(err)
+	}
+
+	client := rpc2.NewClientFromConn(clientConn)
+	defer server.Stop()
+	assertNoError(client.Detach(false), t, "Detach")
 }

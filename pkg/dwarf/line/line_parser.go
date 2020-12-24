@@ -9,6 +9,7 @@ import (
 	"github.com/go-delve/delve/pkg/dwarf/util"
 )
 
+// DebugLinePrologue prologue of .debug_line data.
 type DebugLinePrologue struct {
 	UnitLength     uint32
 	Version        uint16
@@ -22,6 +23,7 @@ type DebugLinePrologue struct {
 	StdOpLengths   []uint8
 }
 
+// DebugLineInfo info of .debug_line data.
 type DebugLineInfo struct {
 	Prologue     *DebugLinePrologue
 	IncludeDirs  []string
@@ -43,8 +45,10 @@ type DebugLineInfo struct {
 	// if normalizeBackslash is true all backslashes (\) will be converted into forward slashes (/)
 	normalizeBackslash bool
 	ptrSize            int
+	endSeqIsValid      bool
 }
 
+// FileEntry file entry in File Name Table.
 type FileEntry struct {
 	Path        string
 	DirIdx      uint64

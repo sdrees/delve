@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"go/constant"
+	"io/ioutil"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -91,7 +92,7 @@ func evalScope(p *proc.Target) (*proc.EvalScope, error) {
 	if err != nil {
 		return nil, err
 	}
-	return proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frame), nil
+	return proc.FrameToScope(p.BinInfo(), p.Memory(), nil, frame), nil
 }
 
 func evalVariable(p *proc.Target, symbol string, cfg proc.LoadConfig) (*proc.Variable, error) {
@@ -442,6 +443,7 @@ func TestLocalVariables(t *testing.T) {
 				{"f32", true, "1.2", "", "float32", nil},
 				{"i32", true, "[2]int32 [1,2]", "", "[2]int32", nil},
 				{"i8", true, "1", "", "int8", nil},
+				{"mp", true, "map[int]interface {} [1: 42, 2: 43, ]", "", "map[int]interface {}", nil},
 				{"ms", true, "main.Nest {Level: 0, Nest: *main.Nest {Level: 1, Nest: *(*main.Nest)…", "", "main.Nest", nil},
 				{"neg", true, "-1", "", "int", nil},
 				{"u16", true, "65535", "", "uint16", nil},
@@ -468,7 +470,7 @@ func TestLocalVariables(t *testing.T) {
 				var frame proc.Stackframe
 				frame, err = findFirstNonRuntimeFrame(p)
 				if err == nil {
-					scope = proc.FrameToScope(p.BinInfo(), p.CurrentThread(), nil, frame)
+					scope = proc.FrameToScope(p.BinInfo(), p.Memory(), nil, frame)
 				}
 			} else {
 				scope, err = proc.GoroutineScope(p.CurrentThread())
@@ -1150,9 +1152,6 @@ type testCaseCallFunction struct {
 }
 
 func TestCallFunction(t *testing.T) {
-	if runtime.GOARCH == "arm64" {
-		t.Skip("arm64 does not support CallFunction for now")
-	}
 	protest.MustSupportFunctionCalls(t, testBackend)
 
 	var testcases = []testCaseCallFunction{
@@ -1271,6 +1270,9 @@ func TestCallFunction(t *testing.T) {
 		if err != nil {
 			t.Skip("function calls not supported on this version of go")
 		}
+
+		testCallFunctionSetBreakpoint(t, p, fixture)
+
 		assertNoError(p.Continue(), t, "Continue()")
 		for _, tc := range testcases {
 			testCallFunction(t, p, tc)
@@ -1302,6 +1304,17 @@ func TestCallFunction(t *testing.T) {
 		// LEAVE THIS AS THE LAST ITEM, IT BREAKS THE TARGET PROCESS!!!
 		testCallFunction(t, p, testCaseCallFunction{"-unsafe escapeArg(&a2)", nil, nil})
 	})
+}
+
+func testCallFunctionSetBreakpoint(t *testing.T, p *proc.Target, fixture protest.Fixture) {
+	buf, err := ioutil.ReadFile(fixture.Source)
+	assertNoError(err, t, "ReadFile")
+	for i, line := range strings.Split(string(buf), "\n") {
+		if strings.Contains(line, "// breakpoint here") {
+			setFileBreakpoint(p, t, fixture, i+1)
+			return
+		}
+	}
 }
 
 func testCallFunction(t *testing.T, p *proc.Target, tc testCaseCallFunction) {

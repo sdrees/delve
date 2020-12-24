@@ -201,6 +201,9 @@ type G struct {
 	stkbarPos int       // stkbarPos field of g struct
 	stack     stack     // value of stack
 
+	WaitSince  int64
+	WaitReason int64
+
 	SystemStack bool // SystemStack is true if this goroutine is currently executing on a system stack.
 
 	// Information on goroutine location
@@ -310,16 +313,13 @@ func GoroutinesInfo(dbp *Target, start, count int) ([]*G, int, error) {
 
 	threads := dbp.ThreadList()
 	for _, th := range threads {
-		if th.Blocked() {
-			continue
-		}
 		g, _ := GetG(th)
 		if g != nil {
 			threadg[g.ID] = g
 		}
 	}
 
-	allgptr, allglen, err := dbp.gcache.getRuntimeAllg(dbp.BinInfo(), dbp.CurrentThread())
+	allgptr, allglen, err := dbp.gcache.getRuntimeAllg(dbp.BinInfo(), dbp.Memory())
 	if err != nil {
 		return nil, -1, err
 	}
@@ -434,7 +434,7 @@ func getGVariable(thread Thread) (*Variable, error) {
 	gaddr, hasgaddr := regs.GAddr()
 	if !hasgaddr {
 		var err error
-		gaddr, err = readUintRaw(thread, regs.TLS()+thread.BinInfo().GStructOffset(), int64(thread.BinInfo().Arch.PtrSize()))
+		gaddr, err = readUintRaw(thread.ProcessMemory(), regs.TLS()+thread.BinInfo().GStructOffset(), int64(thread.BinInfo().Arch.PtrSize()))
 		if err != nil {
 			return nil, err
 		}
@@ -568,7 +568,7 @@ func globalScope(bi *BinaryInfo, image *Image, mem MemoryReadWriter) *EvalScope 
 }
 
 func newVariableFromThread(t Thread, name string, addr uint64, dwarfType godwarf.Type) *Variable {
-	return newVariable(name, addr, dwarfType, t.BinInfo(), t)
+	return newVariable(name, addr, dwarfType, t.BinInfo(), t.ProcessMemory())
 }
 
 func (v *Variable) newVariable(name string, addr uint64, dwarfType godwarf.Type, mem MemoryReadWriter) *Variable {
@@ -849,6 +849,8 @@ func (v *Variable) parseG() (*G, error) {
 	id := loadInt64Maybe("goid")
 	gopc := loadInt64Maybe("gopc")
 	startpc := loadInt64Maybe("startpc")
+	waitSince := loadInt64Maybe("waitsince")
+	waitReason := loadInt64Maybe("waitreason")
 	var stackhi, stacklo uint64
 	if stackVar := v.loadFieldNamed("stack"); stackVar != nil {
 		if stackhiVar := stackVar.fieldVariable("hi"); stackhiVar != nil {
@@ -885,6 +887,8 @@ func (v *Variable) parseG() (*G, error) {
 		BP:         uint64(bp),
 		LR:         uint64(lr),
 		Status:     uint64(status),
+		WaitSince:  waitSince,
+		WaitReason: waitReason,
 		CurrentLoc: Location{PC: uint64(pc), File: f, Line: l, Fn: fn},
 		variable:   v,
 		stkbarVar:  stkbarVar,
@@ -922,7 +926,7 @@ var errTracebackAncestorsDisabled = errors.New("tracebackancestors is disabled")
 
 // Ancestors returns the list of ancestors for g.
 func Ancestors(p Process, g *G, n int) ([]Ancestor, error) {
-	scope := globalScope(p.BinInfo(), p.BinInfo().Images[0], p.CurrentThread())
+	scope := globalScope(p.BinInfo(), p.BinInfo().Images[0], p.Memory())
 	tbav, err := scope.EvalExpression("runtime.debug.tracebackancestors", loadSingleValue)
 	if err == nil && tbav.Unreadable == nil && tbav.Kind == reflect.Int {
 		tba, _ := constant.Int64Val(tbav.Value)

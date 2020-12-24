@@ -247,8 +247,8 @@ func TestExecuteFile(t *testing.T) {
 }
 
 func TestIssue354(t *testing.T) {
-	printStack(os.Stdout, []api.Stackframe{}, "", false)
-	printStack(os.Stdout, []api.Stackframe{
+	printStack(&Term{}, os.Stdout, []api.Stackframe{}, "", false)
+	printStack(&Term{}, os.Stdout, []api.Stackframe{
 		{Location: api.Location{PC: 0, File: "irrelevant.go", Line: 10, Function: nil},
 			Bottom: true}}, "", false)
 }
@@ -342,19 +342,6 @@ func TestScopePrefix(t *testing.T) {
 	const goroutinesCurLinePrefix = "* Goroutine "
 	test.AllowRecording(t)
 
-	tgtAgoroutineCount := 10
-
-	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
-		// We try to make sure that all goroutines are stopped at a sensible place
-		// before reading their stacktrace, but due to the nature of the test
-		// program there is no guarantee that we always find them in a reasonable
-		// state.
-		// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
-		// unnecessary flakiness reduce the target count to 9, allowing one
-		// goroutine to be in a bad state.
-		tgtAgoroutineCount = 9
-	}
-
 	withTestTerminal("goroutinestackprog", t, func(term *FakeTerminal) {
 		term.MustExec("b stacktraceme")
 		term.MustExec("continue")
@@ -407,7 +394,7 @@ func TestScopePrefix(t *testing.T) {
 					}
 				}
 			}
-			if len(agoroutines)+extraAgoroutines < tgtAgoroutineCount {
+			if len(agoroutines)+extraAgoroutines < 10 {
 				t.Fatalf("Output of goroutines did not have 10 goroutines stopped on main.agoroutine (%d+%d found): %q", len(agoroutines), extraAgoroutines, goroutinesOut)
 			}
 		}
@@ -451,12 +438,8 @@ func TestScopePrefix(t *testing.T) {
 			seen[ival] = true
 		}
 
-		firsterr := tgtAgoroutineCount != 10
-
 		for i := range seen {
-			if firsterr {
-				firsterr = false
-			} else if !seen[i] {
+			if !seen[i] {
 				t.Fatalf("goroutine %d not found", i)
 			}
 		}
@@ -536,21 +519,8 @@ func TestOnPrefix(t *testing.T) {
 			}
 		}
 
-		firsterr := false
-		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
-			// We try to make sure that all goroutines are stopped at a sensible place
-			// before reading their stacktrace, but due to the nature of the test
-			// program there is no guarantee that we always find them in a reasonable
-			// state.
-			// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
-			// unnecessary flakiness allow a single goroutine to be in a bad state.
-			firsterr = true
-		}
-
 		for i := range seen {
-			if firsterr {
-				firsterr = false
-			} else if !seen[i] {
+			if !seen[i] {
 				t.Fatalf("Goroutine %d not seen\n", i)
 			}
 		}
@@ -608,21 +578,8 @@ func TestOnPrefixLocals(t *testing.T) {
 			}
 		}
 
-		firsterr := false
-		if goversion.VersionAfterOrEqual(runtime.Version(), 1, 14) {
-			// We try to make sure that all goroutines are stopped at a sensible place
-			// before reading their stacktrace, but due to the nature of the test
-			// program there is no guarantee that we always find them in a reasonable
-			// state.
-			// Asynchronous preemption in Go 1.14 exacerbates this problem, to avoid
-			// unnecessary flakiness allow a single goroutine to be in a bad state.
-			firsterr = true
-		}
-
 		for i := range seen {
-			if firsterr {
-				firsterr = false
-			} else if !seen[i] {
+			if !seen[i] {
 				t.Fatalf("Goroutine %d not seen\n", i)
 			}
 		}
@@ -687,6 +644,7 @@ func TestIssue387(t *testing.T) {
 }
 
 func listIsAt(t *testing.T, term *FakeTerminal, listcmd string, cur, start, end int) {
+	t.Helper()
 	outstr := term.MustExec(listcmd)
 	lines := strings.Split(outstr, "\n")
 
@@ -731,10 +689,10 @@ func TestListCmd(t *testing.T) {
 	withTestTerminal("testvariables", t, func(term *FakeTerminal) {
 		term.MustExec("continue")
 		term.MustExec("continue")
-		listIsAt(t, term, "list", 25, 20, 30)
-		listIsAt(t, term, "list 69", 69, 64, 70)
-		listIsAt(t, term, "frame 1 list", 62, 57, 67)
-		listIsAt(t, term, "frame 1 list 69", 69, 64, 70)
+		listIsAt(t, term, "list", 27, 22, 32)
+		listIsAt(t, term, "list 69", 69, 64, 73)
+		listIsAt(t, term, "frame 1 list", 65, 60, 70)
+		listIsAt(t, term, "frame 1 list 69", 69, 64, 73)
 		_, err := term.Exec("frame 50 list")
 		if err == nil {
 			t.Fatalf("Expected error requesting 50th frame")
@@ -1065,9 +1023,6 @@ func findStarFile(name string) string {
 }
 
 func TestIssue1598(t *testing.T) {
-	if runtime.GOARCH == "arm64" || runtime.GOARCH == "386" {
-		t.Skip(fmt.Errorf("%s does not support FunctionCall for now", runtime.GOARCH))
-	}
 	test.MustSupportFunctionCalls(t, testBackend)
 	withTestTerminal("issue1598", t, func(term *FakeTerminal) {
 		term.MustExec("break issue1598.go:5")

@@ -204,6 +204,7 @@ func EvalExpressionWithCalls(t *Target, g *G, expr string, retLoadCfg LoadConfig
 
 func finishEvalExpressionWithCalls(t *Target, g *G, contReq continueRequest, ok bool) error {
 	fncallLog("stashing return values for %d in thread=%d", g.ID, g.Thread.ThreadID())
+	g.Thread.Common().CallReturn = true
 	var err error
 	if !ok {
 		err = errors.New("internal error EvalExpressionWithCalls didn't return anything")
@@ -309,12 +310,13 @@ func evalFunctionCall(scope *EvalScope, node *ast.CallExpr) (*Variable, error) {
 		return nil, err
 	}
 	// write the desired argument frame size at SP-(2*pointer_size) (the extra pointer is the saved PC)
-	if err := writePointer(bi, thread, regs.SP()-3*uint64(bi.Arch.PtrSize()), uint64(fncall.argFrameSize)); err != nil {
+	if err := writePointer(bi, scope.Mem, regs.SP()-3*uint64(bi.Arch.PtrSize()), uint64(fncall.argFrameSize)); err != nil {
 		return nil, err
 	}
 
 	fncallLog("function call initiated %v frame size %d goroutine %d (thread %d)", fncall.fn, fncall.argFrameSize, scope.g.ID, thread.ThreadID())
 
+	thread.Breakpoint().Clear() // since we moved address in PC the thread is no longer stopped at a breakpoint, leaving the breakpoint set will confuse Continue
 	p.fncallForG[scope.g.ID].startThreadID = thread.ThreadID()
 
 	spoff := int64(scope.Regs.Uint64Val(scope.Regs.SPRegNum)) - int64(scope.g.stack.hi)
@@ -422,7 +424,7 @@ func callOP(bi *BinaryInfo, thread Thread, regs Registers, callAddr uint64) erro
 	if err := thread.SetSP(sp); err != nil {
 		return err
 	}
-	if err := writePointer(bi, thread, sp, regs.PC()); err != nil {
+	if err := writePointer(bi, thread.ProcessMemory(), sp, regs.PC()); err != nil {
 		return err
 	}
 	return thread.SetPC(callAddr)
@@ -943,6 +945,10 @@ func isCallInjectionStop(t *Target, thread Thread, loc *Location) bool {
 		return false
 	}
 	if !strings.HasPrefix(loc.Fn.Name, debugCallFunctionNamePrefix1) && !strings.HasPrefix(loc.Fn.Name, debugCallFunctionNamePrefix2) {
+		return false
+	}
+	if loc.PC == loc.Fn.Entry {
+		// call injection just started, did not make any progress before being interrupted by a concurrent breakpoint.
 		return false
 	}
 	text, err := disassembleCurrentInstruction(t, thread, -1)
