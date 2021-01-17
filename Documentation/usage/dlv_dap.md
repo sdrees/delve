@@ -7,12 +7,16 @@
 
 [EXPERIMENTAL] Starts a TCP server communicating via Debug Adaptor Protocol (DAP).
 
-The server supports debugging of a precompiled binary akin to 'dlv exec' via a launch request.
-It does not yet support support specification of program arguments.
-It does not yet support launch requests with 'debug' and 'test' modes that require compilation.
-It does not yet support attach requests to debug a running process like with 'dlv attach'.
-It does not yet support asynchronous request-response communication.
-The server does not accept multiple client connections.
+The server is headless and requires a DAP client like vscode to connect and request a binary
+to be launched or process to be attached to. The following modes are supported:
+- launch + exec (executes precompiled binary, like 'dlv exec')
+- launch + debug (builds and launches, like 'dlv debug')
+- launch + test (builds and tests, like 'dlv test')
+- attach + local (attaches to a running process, like 'dlv attach')
+The server does not yet support asynchronous request-response communication, so features
+like pausing or setting breakpoints while the program is running are not yet available.
+The server does not accept multiple client connections (--accept-multiclient),
+a feature that is often relied on to enable --continue with remote debugging.
 
 ```
 dlv dap
@@ -25,7 +29,7 @@ dlv dap
       --allow-non-terminal-interactive   Allows interactive sessions of Delve that don't have a terminal as stdin, stdout and stderr
       --api-version int                  Selects API version when headless. New clients should use v2. Can be reset via RPCServer.SetApiVersion. See Documentation/api/json-rpc/README.md. (default 1)
       --backend string                   Backend selection (see 'dlv help backend'). (default "default")
-      --build-flags string               Build flags, to be passed to the compiler.
+      --build-flags string               Build flags, to be passed to the compiler. For example: --build-flags="-tags=integration -mod=vendor -cover -v"
       --check-go-version                 Checks that the version of Go in use is compatible with Delve. (default true)
       --disable-aslr                     Disables address space randomization
       --headless                         Run debug server only, in headless mode.

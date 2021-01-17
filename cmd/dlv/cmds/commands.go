@@ -126,7 +126,7 @@ func New(docCall bool) *cobra.Command {
 	rootCommand.PersistentFlags().BoolVarP(&acceptMulti, "accept-multiclient", "", false, "Allows a headless server to accept multiple client connections.")
 	rootCommand.PersistentFlags().IntVar(&apiVersion, "api-version", 1, "Selects API version when headless. New clients should use v2. Can be reset via RPCServer.SetApiVersion. See Documentation/api/json-rpc/README.md.")
 	rootCommand.PersistentFlags().StringVar(&initFile, "init", "", "Init file, executed by the terminal client.")
-	rootCommand.PersistentFlags().StringVar(&buildFlags, "build-flags", buildFlagsDefault, "Build flags, to be passed to the compiler.")
+	rootCommand.PersistentFlags().StringVar(&buildFlags, "build-flags", buildFlagsDefault, "Build flags, to be passed to the compiler. For example: --build-flags=\"-tags=integration -mod=vendor -cover -v\"")
 	rootCommand.PersistentFlags().StringVar(&workingDir, "wd", "", "Working directory for running the program.")
 	rootCommand.PersistentFlags().BoolVarP(&checkGoVersion, "check-go-version", "", true, "Checks that the version of Go in use is compatible with Delve.")
 	rootCommand.PersistentFlags().BoolVarP(&checkLocalConnUser, "only-same-user", "", true, "Only connections from the same user that started this instance of Delve are allowed to connect.")
@@ -177,12 +177,16 @@ option to let the process continue or kill it.
 		Short: "[EXPERIMENTAL] Starts a TCP server communicating via Debug Adaptor Protocol (DAP).",
 		Long: `[EXPERIMENTAL] Starts a TCP server communicating via Debug Adaptor Protocol (DAP).
 
-The server supports debugging of a precompiled binary akin to 'dlv exec' via a launch request.
-It does not yet support support specification of program arguments.
-It does not yet support launch requests with 'debug' and 'test' modes that require compilation.
-It does not yet support attach requests to debug a running process like with 'dlv attach'.
-It does not yet support asynchronous request-response communication.
-The server does not accept multiple client connections.`,
+The server is headless and requires a DAP client like vscode to connect and request a binary
+to be launched or process to be attached to. The following modes are supported:
+- launch + exec (executes precompiled binary, like 'dlv exec')
+- launch + debug (builds and launches, like 'dlv debug')
+- launch + test (builds and tests, like 'dlv test')
+- attach + local (attaches to a running process, like 'dlv attach')
+The server does not yet support asynchronous request-response communication, so features
+like pausing or setting breakpoints while the program is running are not yet available.
+The server does not accept multiple client connections (--accept-multiclient),
+a feature that is often relied on to enable --continue with remote debugging.`,
 		Run: dapCmd,
 	}
 	rootCommand.AddCommand(dapCommand)
@@ -403,10 +407,10 @@ func dapCmd(cmd *cobra.Command, args []string) {
 		defer logflags.Close()
 
 		if headless {
-			fmt.Fprintf(os.Stderr, "Warning: headless mode not supported with dap\n")
+			fmt.Fprintf(os.Stderr, "Warning: dap mode is always headless\n")
 		}
 		if acceptMulti {
-			fmt.Fprintf(os.Stderr, "Warning: accept multiclient mode not supported with dap\n")
+			fmt.Fprintf(os.Stderr, "Warning: accept-multiclient mode not supported with dap\n")
 		}
 		if initFile != "" {
 			fmt.Fprint(os.Stderr, "Warning: init file ignored with dap\n")
