@@ -1787,18 +1787,15 @@ func (bi *BinaryInfo) addAbstractSubprogram(entry *dwarf.Entry, ctxt *loadDebugI
 		return
 	}
 
-	fn := Function{
-		Name:   name,
-		offset: entry.Offset,
-		cu:     cu,
-	}
-
 	if entry.Children {
 		bi.loadDebugInfoMapsInlinedCalls(ctxt, reader, cu)
 	}
 
-	bi.Functions = append(bi.Functions, fn)
-	ctxt.abstractOriginTable[entry.Offset] = len(bi.Functions) - 1
+	originIdx := ctxt.lookupAbstractOrigin(bi, entry.Offset)
+	fn := &bi.Functions[originIdx]
+	fn.Name = name
+	fn.offset = entry.Offset
+	fn.cu = cu
 }
 
 // addConcreteInlinedSubprogram adds the concrete entry of a subprogram that was also inlined.
@@ -1812,15 +1809,7 @@ func (bi *BinaryInfo) addConcreteInlinedSubprogram(entry *dwarf.Entry, originOff
 		return
 	}
 
-	originIdx, ok := ctxt.abstractOriginTable[originOffset]
-	if !ok {
-		bi.logger.Warnf("reading debug_info: could not find abstract origin of concrete inlined subprogram at %#x (origin offset %#x)", entry.Offset, originOffset)
-		if entry.Children {
-			reader.SkipChildren()
-		}
-		return
-	}
-
+	originIdx := ctxt.lookupAbstractOrigin(bi, originOffset)
 	fn := &bi.Functions[originIdx]
 	fn.offset = entry.Offset
 	fn.Entry = lowpc
@@ -1905,12 +1894,7 @@ func (bi *BinaryInfo) loadDebugInfoMapsInlinedCalls(ctxt *loadDebugInfoMapsConte
 				continue
 			}
 
-			originIdx, ok := ctxt.abstractOriginTable[originOffset]
-			if !ok {
-				bi.logger.Warnf("reading debug_info: could not find abstract origin (%#x) of inlined call at %#x", originOffset, entry.Offset)
-				reader.SkipChildren()
-				continue
-			}
+			originIdx := ctxt.lookupAbstractOrigin(bi, originOffset)
 			fn := &bi.Functions[originIdx]
 
 			lowpc, highpc, ok := subprogramEntryRange(entry, cu.image)
@@ -1927,17 +1911,12 @@ func (bi *BinaryInfo) loadDebugInfoMapsInlinedCalls(ctxt *loadDebugInfoMapsConte
 				reader.SkipChildren()
 				continue
 			}
-			if cu.lineInfo == nil {
-				bi.logger.Warnf("reading debug_info: inlined call on a compilation unit without debug_line section at %#x", entry.Offset)
+			callfile, cferr := cu.filePath(int(callfileidx), entry)
+			if cferr != nil {
+				bi.logger.Warnf("%v", cferr)
 				reader.SkipChildren()
 				continue
 			}
-			if int(callfileidx-1) >= len(cu.lineInfo.FileNames) {
-				bi.logger.Warnf("reading debug_info: CallFile (%d) of inlined call does not exist in compile unit file table at %#x", callfileidx, entry.Offset)
-				reader.SkipChildren()
-				continue
-			}
-			callfile := cu.lineInfo.FileNames[callfileidx-1].Path
 
 			fn.InlinedCalls = append(fn.InlinedCalls, InlinedCall{
 				cu:     cu,
@@ -2097,4 +2076,26 @@ func (bi *BinaryInfo) ListPackagesBuildInfo(includeFiles bool) []*PackageBuildIn
 
 	sort.Slice(r, func(i, j int) bool { return r[i].ImportPath < r[j].ImportPath })
 	return r
+}
+
+// cuFilePath takes a compilation unit "cu" and a file index reference
+// "fileidx" and returns the corresponding file name entry from the
+// DWARF line table associated with the unit; "entry" is the offset of
+// the attribute where the file reference originated, for logging
+// purposes. Return value is the file string and an error value; error
+// will be non-nil if the file could not be recovered, perhaps due to
+// malformed DWARF.
+func (cu *compileUnit) filePath(fileidx int, entry *dwarf.Entry) (string, error) {
+	if cu.lineInfo == nil {
+		return "", fmt.Errorf("reading debug_info: file reference within a compilation unit without debug_line section at %#x", entry.Offset)
+	}
+	// File numbering is slightly different before and after DWARF 5;
+	// account for this here. See section 6.2.4 of the DWARF 5 spec.
+	if cu.Version < 5 {
+		fileidx--
+	}
+	if fileidx < 0 || fileidx >= len(cu.lineInfo.FileNames) {
+		return "", fmt.Errorf("reading debug_info: file index (%d) out of range in compile unit file table at %#x", fileidx, entry.Offset)
+	}
+	return cu.lineInfo.FileNames[fileidx].Path, nil
 }

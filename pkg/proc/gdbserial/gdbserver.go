@@ -80,6 +80,7 @@ import (
 	"golang.org/x/arch/arm64/arm64asm"
 	"golang.org/x/arch/x86/x86asm"
 
+	"github.com/go-delve/delve/pkg/elfwriter"
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/linutil"
@@ -650,7 +651,8 @@ func (p *gdbProcess) initialize(path string, debugInfoDirs []string, stopReason 
 		Path:                path,
 		DebugInfoDirs:       debugInfoDirs,
 		DisableAsyncPreempt: runtime.GOOS == "darwin",
-		StopReason:          stopReason})
+		StopReason:          stopReason,
+		CanDump:             runtime.GOOS == "darwin"})
 	if err != nil {
 		p.conn.conn.Close()
 		return nil, err
@@ -1171,14 +1173,8 @@ func (p *gdbProcess) FindBreakpoint(pc uint64) (*proc.Breakpoint, bool) {
 	return nil, false
 }
 
-func (p *gdbProcess) WriteBreakpoint(addr uint64) (string, int, *proc.Function, []byte, error) {
-	f, l, fn := p.bi.PCToLine(uint64(addr))
-
-	if err := p.conn.setBreakpoint(addr); err != nil {
-		return "", 0, nil, nil, err
-	}
-
-	return f, l, fn, nil, nil
+func (p *gdbProcess) WriteBreakpoint(bp *proc.Breakpoint) error {
+	return p.conn.setBreakpoint(bp.Addr)
 }
 
 func (p *gdbProcess) EraseBreakpoint(bp *proc.Breakpoint) error {
@@ -1460,6 +1456,37 @@ func (p *gdbProcess) loadGInstr() []byte {
 	buf.Write(op)
 	binary.Write(buf, binary.LittleEndian, uint32(p.bi.GStructOffset()))
 	return buf.Bytes()
+}
+
+func (p *gdbProcess) MemoryMap() ([]proc.MemoryMapEntry, error) {
+	r := []proc.MemoryMapEntry{}
+	addr := uint64(0)
+	for addr != ^uint64(0) {
+		mri, err := p.conn.memoryRegionInfo(addr)
+		if err != nil {
+			return nil, err
+		}
+		if addr+mri.size <= addr {
+			return nil, errors.New("qMemoryRegionInfo response wrapped around the address space or stuck")
+		}
+		if mri.permissions != "" {
+			var mme proc.MemoryMapEntry
+
+			mme.Addr = addr
+			mme.Size = mri.size
+			mme.Read = strings.Contains(mri.permissions, "r")
+			mme.Write = strings.Contains(mri.permissions, "w")
+			mme.Exec = strings.Contains(mri.permissions, "x")
+
+			r = append(r, mme)
+		}
+		addr += mri.size
+	}
+	return r, nil
+}
+
+func (p *gdbProcess) DumpProcessNotes(notes []elfwriter.Note, threadDone func()) (threadsDone bool, out []elfwriter.Note, err error) {
+	return false, notes, nil
 }
 
 func (regs *gdbRegisters) init(regsInfo []gdbRegisterInfo, arch *proc.Arch) {

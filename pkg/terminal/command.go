@@ -24,6 +24,7 @@ import (
 
 	"github.com/cosiner/argv"
 	"github.com/go-delve/delve/pkg/locspec"
+	"github.com/go-delve/delve/pkg/terminal/colorize"
 	"github.com/go-delve/delve/service"
 	"github.com/go-delve/delve/service/api"
 	"github.com/go-delve/delve/service/rpc2"
@@ -409,6 +410,12 @@ For example:
 The '-a' option adds an expression to the list of expression printed every time the program stops. The '-d' option removes the specified expression from the list.
 
 If display is called without arguments it will print the value of all expression in the list.`},
+
+		{aliases: []string{"dump"}, cmdFn: dump, helpMsg: `Creates a core dump from the current process state
+
+	dump <output file>
+
+The core dump is always written in ELF, even on systems (windows, macOS) where this is not customary. For environments other than linux/amd64 threads and registers are dumped in a format that only Delve can read back.`},
 	}
 
 	addrecorded := client == nil
@@ -2247,7 +2254,7 @@ func printcontext(t *Term, state *api.DebuggerState) {
 
 	if th.File == "" {
 		fmt.Printf("Stopped at: 0x%x\n", state.CurrentThread.PC)
-		t.Println("=>", "no source available")
+		_ = colorize.Print(t.stdout, "", bytes.NewReader([]byte("no source available")), 1, 10, 1, nil)
 		return
 	}
 
@@ -2424,6 +2431,13 @@ func printfile(t *Term, filename string, line int, showArrow bool) error {
 	if filename == "" {
 		return nil
 	}
+
+	lineCount := t.conf.GetSourceListLineCount()
+	arrowLine := 0
+	if showArrow {
+		arrowLine = line
+	}
+
 	file, err := os.Open(t.substitutePath(filename))
 	if err != nil {
 		return err
@@ -2436,38 +2450,7 @@ func printfile(t *Term, filename string, line int, showArrow bool) error {
 		fmt.Println("Warning: listing may not match stale executable")
 	}
 
-	lineCount := t.conf.GetSourceListLineCount()
-
-	buf := bufio.NewScanner(file)
-	l := line
-	for i := 1; i < l-lineCount; i++ {
-		if !buf.Scan() {
-			return nil
-		}
-	}
-
-	s := l - lineCount
-	if s < 1 {
-		s = 1
-	}
-
-	for i := s; i <= l+lineCount; i++ {
-		if !buf.Scan() {
-			return nil
-		}
-
-		var prefix string
-		if showArrow {
-			prefix = "  "
-			if i == l {
-				prefix = "=>"
-			}
-		}
-
-		prefix = fmt.Sprintf("%s%4d:\t", prefix, i)
-		t.Println(prefix, buf.Text())
-	}
-	return nil
+	return colorize.Print(t.stdout, file.Name(), file, line-lineCount, line+lineCount+1, arrowLine, t.colorEscapes)
 }
 
 // ExitRequestError is returned when the user
@@ -2652,6 +2635,33 @@ func display(t *Term, ctx callContext, args string) error {
 
 	default:
 		return fmt.Errorf("wrong arguments")
+	}
+	return nil
+}
+
+func dump(t *Term, ctx callContext, args string) error {
+	dumpState, err := t.client.CoreDumpStart(args)
+	if err != nil {
+		return err
+	}
+	for {
+		if dumpState.ThreadsDone != dumpState.ThreadsTotal {
+			fmt.Printf("\rDumping threads %d / %d...", dumpState.ThreadsDone, dumpState.ThreadsTotal)
+		} else {
+			fmt.Printf("\rDumping memory %d / %d...", dumpState.MemDone, dumpState.MemTotal)
+		}
+		if !dumpState.Dumping {
+			break
+		}
+		dumpState = t.client.CoreDumpWait(1000)
+	}
+	fmt.Printf("\n")
+	if dumpState.Err != "" {
+		fmt.Printf("error dumping: %s\n", dumpState.Err)
+	} else if !dumpState.AllDone {
+		fmt.Printf("canceled\n")
+	} else if dumpState.MemDone != dumpState.MemTotal {
+		fmt.Printf("Core dump could be incomplete\n")
 	}
 	return nil
 }

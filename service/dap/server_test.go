@@ -1026,7 +1026,7 @@ func TestScopesAndVariablesRequests2(t *testing.T) {
 				execute: func() {
 					client.StackTraceRequest(1, 0, 20)
 					stack := client.ExpectStackTraceResponse(t)
-					expectStackFrames(t, stack, "main.main", 317, 1000, 3, 3)
+					expectStackFrames(t, stack, "main.main", -1, 1000, 3, 3)
 
 					client.ScopesRequest(1000)
 					scopes := client.ExpectScopesResponse(t)
@@ -1039,7 +1039,7 @@ func TestScopesAndVariablesRequests2(t *testing.T) {
 				execute: func() {
 					client.StackTraceRequest(1, 0, 20)
 					stack := client.ExpectStackTraceResponse(t)
-					expectStackFrames(t, stack, "main.main", 322, 1000, 3, 3)
+					expectStackFrames(t, stack, "main.main", -1, 1000, 3, 3)
 
 					client.ScopesRequest(1000)
 					scopes := client.ExpectScopesResponse(t)
@@ -2097,6 +2097,9 @@ func TestLaunchRequestWithBuildFlags(t *testing.T) {
 func TestAttachRequest(t *testing.T) {
 	if runtime.GOOS == "freebsd" {
 		t.SkipNow()
+	}
+	if runtime.GOOS == "windows" {
+		t.Skip("test skipped on windows, see https://delve.beta.teamcity.com/project/Delve_windows for details")
 	}
 	runTest(t, "loopprog", func(client *daptest.Client, fixture protest.Fixture) {
 		// Start the program to attach to

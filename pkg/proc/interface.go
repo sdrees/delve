@@ -1,5 +1,7 @@
 package proc
 
+import "github.com/go-delve/delve/pkg/elfwriter"
+
 // Process represents the target of the debugger. This
 // target could be a system process, core file, etc.
 //
@@ -33,8 +35,14 @@ type ProcessInternal interface {
 	Detach(bool) error
 	ContinueOnce() (trapthread Thread, stopReason StopReason, err error)
 
-	WriteBreakpoint(addr uint64) (file string, line int, fn *Function, originalData []byte, err error)
+	WriteBreakpoint(*Breakpoint) error
 	EraseBreakpoint(*Breakpoint) error
+
+	// DumpProcessNotes returns ELF core notes describing the process and its threads.
+	// Implementing this method is optional.
+	DumpProcessNotes(notes []elfwriter.Note, threadDone func()) (bool, []elfwriter.Note, error)
+	// MemoryMap returns the memory map of the target process. This method must be implemented if CanDump is true.
+	MemoryMap() ([]MemoryMapEntry, error)
 }
 
 // RecordingManipulation is an interface for manipulating process recordings.
