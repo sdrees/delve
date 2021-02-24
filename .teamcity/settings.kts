@@ -43,6 +43,7 @@ val targets = arrayOf(
         "linux/386/1.16",
 
         "linux/arm64/1.16",
+        "linux/arm64/tip",
 
         "windows/amd64/1.16",
         "windows/amd64/tip",
@@ -105,6 +106,10 @@ class AggregatorBuild(tests: Collection<BuildType>) : BuildType({
             }
             param("github_oauth_user", "")
         }
+    }
+
+    failureConditions {
+        executionTimeoutMin = 60
     }
 })
 
