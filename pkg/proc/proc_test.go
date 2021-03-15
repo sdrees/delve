@@ -837,6 +837,8 @@ func TestCGONext(t *testing.T) {
 	}
 	protest.MustHaveCgo(t)
 
+	skipOn(t, "broken - cgo stacktraces", "darwin", "arm64")
+
 	protest.AllowRecording(t)
 	withTestProcess("cgotest", t, func(p *proc.Target, fixture protest.Fixture) {
 		setFunctionBreakpoint(p, t, "main.main")
@@ -943,6 +945,8 @@ func stackMatch(stack []loc, locations []proc.Stackframe, skipRuntime bool) bool
 }
 
 func TestStacktraceGoroutine(t *testing.T) {
+	skipOn(t, "broken - cgo stacktraces", "darwin", "arm64")
+
 	mainStack := []loc{{14, "main.stacktraceme"}, {29, "main.main"}}
 	if goversion.VersionAfterOrEqual(runtime.Version(), 1, 11) {
 		mainStack[0].line = 15
@@ -5236,6 +5240,24 @@ func TestCompositeMemoryWrite(t *testing.T) {
 		}
 		if newXmm1 != tgt {
 			t.Errorf("reading xmm1 register, expected %#x, got %#x", uint64(tgt), newXmm1)
+		}
+	})
+}
+
+func TestVariablesWithExternalLinking(t *testing.T) {
+	// Tests that macOSDebugFrameBugWorkaround works.
+	// See:
+	//  https://github.com/golang/go/issues/25841
+	//  https://github.com/go-delve/delve/issues/2346
+	withTestProcessArgs("testvariables2", t, ".", []string{}, protest.BuildModeExternalLinker, func(p *proc.Target, fixture protest.Fixture) {
+		assertNoError(p.Continue(), t, "Continue()")
+		str1Var := evalVariable(p, t, "str1")
+		if str1Var.Unreadable != nil {
+			t.Fatalf("variable str1 is unreadable: %v", str1Var.Unreadable)
+		}
+		t.Logf("%#v", str1Var)
+		if constant.StringVal(str1Var.Value) != "01234567890" {
+			t.Fatalf("wrong value for str1: %v", str1Var.Value)
 		}
 	})
 }
