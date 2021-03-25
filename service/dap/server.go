@@ -16,10 +16,13 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/go-delve/delve/pkg/gobuild"
 	"github.com/go-delve/delve/pkg/logflags"
@@ -67,6 +70,11 @@ type Server struct {
 	variableHandles *variablesHandlesMap
 	// args tracks special settings for handling debug session requests.
 	args launchAttachArgs
+
+	mu sync.Mutex
+
+	// noDebugProcess is set for the noDebug launch process.
+	noDebugProcess *exec.Cmd
 }
 
 // launchAttachArgs captures arguments from launch/attach request that
@@ -428,8 +436,16 @@ func (s *Server) onInitializeRequest(request *dap.InitializeRequest) {
 	s.send(response)
 }
 
-// Output path for the compiled binary in debug or test modes.
-const debugBinary string = "./__debug_bin"
+// Default output file pathname for the compiled binary in debug or test modes,
+// relative to the current working directory of the server.
+const defaultDebugBinary string = "./__debug_bin"
+
+func cleanExeName(name string) string {
+	if runtime.GOOS == "windows" && filepath.Ext(name) != ".exe" {
+		return name + ".exe"
+	}
+	return name
+}
 
 func (s *Server) onLaunchRequest(request *dap.LaunchRequest) {
 	// Validate launch request mode
@@ -456,9 +472,9 @@ func (s *Server) onLaunchRequest(request *dap.LaunchRequest) {
 	if mode == "debug" || mode == "test" {
 		output, ok := request.Arguments["output"].(string)
 		if !ok || output == "" {
-			output = debugBinary
+			output = cleanExeName(defaultDebugBinary)
 		}
-		debugname, err := filepath.Abs(output)
+		debugbinary, err := filepath.Abs(output)
 		if err != nil {
 			s.sendInternalErrorResponse(request.Seq, err.Error())
 			return
@@ -476,11 +492,12 @@ func (s *Server) onLaunchRequest(request *dap.LaunchRequest) {
 			}
 		}
 
+		s.log.Debugf("building binary at %s", debugbinary)
 		switch mode {
 		case "debug":
-			err = gobuild.GoBuild(debugname, []string{program}, buildFlags)
+			err = gobuild.GoBuild(debugbinary, []string{program}, buildFlags)
 		case "test":
-			err = gobuild.GoTestBuild(debugname, []string{program}, buildFlags)
+			err = gobuild.GoTestBuild(debugbinary, []string{program}, buildFlags)
 		}
 		if err != nil {
 			s.sendErrorResponse(request.Request,
@@ -488,8 +505,8 @@ func (s *Server) onLaunchRequest(request *dap.LaunchRequest) {
 				fmt.Sprintf("Build error: %s", err.Error()))
 			return
 		}
-		program = debugname
-		s.binaryToRemove = debugname
+		program = debugbinary
+		s.binaryToRemove = debugbinary
 	}
 
 	s.setLaunchAttachArgs(request)
@@ -532,6 +549,17 @@ func (s *Server) onLaunchRequest(request *dap.LaunchRequest) {
 		s.config.Debugger.WorkingDir = wdParsed
 	}
 
+	noDebug, ok := request.Arguments["noDebug"]
+	if ok {
+		if v, ok := noDebug.(bool); ok && v { // noDebug == true
+			if err := s.runWithoutDebug(program, targetArgs, s.config.Debugger.WorkingDir); err != nil {
+				s.sendErrorResponse(request.Request, FailedToLaunch, "Failed to launch", err.Error())
+			} else { // program terminated.
+				s.send(&dap.TerminatedEvent{Event: *newEvent("terminated")})
+			}
+			return
+		}
+	}
 	var err error
 	if s.debugger, err = debugger.New(&s.config.Debugger, s.config.ProcessArgs); err != nil {
 		s.sendErrorResponse(request.Request,
@@ -544,6 +572,52 @@ func (s *Server) onLaunchRequest(request *dap.LaunchRequest) {
 	// will end the configuration sequence with 'configurationDone'.
 	s.send(&dap.InitializedEvent{Event: *newEvent("initialized")})
 	s.send(&dap.LaunchResponse{Response: *newResponse(request.Request)})
+}
+
+func (s *Server) runWithoutDebug(program string, targetArgs []string, wd string) error {
+	s.log.Println("Running without debug: ", program)
+
+	cmd := exec.Command(program, targetArgs...)
+	// TODO: send stdin/out/err as OutputEvent messages
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.Stdin = os.Stdin
+	cmd.Dir = s.config.Debugger.WorkingDir
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.noDebugProcess != nil {
+		return fmt.Errorf("previous process (pid=%v) is still active", s.noDebugProcess.Process.Pid)
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	s.noDebugProcess = cmd
+	s.mu.Unlock() // allow disconnect or restart requests to call stopNoDebugProcess.
+
+	// block until the process terminates.
+	if err := cmd.Wait(); err != nil {
+		s.log.Errorf("process exited with %v", err)
+	}
+
+	s.mu.Lock()
+	if s.noDebugProcess == cmd {
+		s.noDebugProcess = nil
+	}
+	return nil // Program ran and terminated.
+}
+
+func (s *Server) stopNoDebugProcess() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.noDebugProcess == nil {
+		return
+	}
+
+	// TODO(hyangah): gracefully terminate the process and its children processes.
+	if err := s.noDebugProcess.Process.Kill(); err != nil {
+		s.log.Errorf("killing process (pid=%v) failed: %v", s.noDebugProcess.Process.Pid, err)
+	}
 }
 
 // TODO(polina): support "remote" mode
@@ -578,6 +652,8 @@ func (s *Server) onDisconnectRequest(request *dap.DisconnectRequest) {
 		if err != nil {
 			s.log.Error(err)
 		}
+	} else {
+		s.stopNoDebugProcess()
 	}
 	// TODO(polina): make thread-safe when handlers become asynchronous.
 	s.signalDisconnect()
@@ -986,7 +1062,10 @@ func (s *Server) onVariablesRequest(request *dap.VariablesRequest) {
 					Value:        val,
 				}
 				if keyref != 0 { // key is a type to be expanded
-					kvvar.Name = fmt.Sprintf("%s(%#x)", kvvar.Name, keyv.Addr) // Make the name unique
+					if len(key) > DefaultLoadConfig.MaxStringLen {
+						// Truncate and make unique
+						kvvar.Name = fmt.Sprintf("%s... @ %#x", key[0:DefaultLoadConfig.MaxStringLen], keyv.Addr)
+					}
 					kvvar.VariablesReference = keyref
 				} else if valref != 0 { // val is a type to be expanded
 					kvvar.VariablesReference = valref
