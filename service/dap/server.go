@@ -159,7 +159,12 @@ func (s *Server) Stop() {
 	if s.debugger != nil {
 		kill := s.config.Debugger.AttachPid == 0
 		if err := s.debugger.Detach(kill); err != nil {
-			s.log.Error(err)
+			switch err.(type) {
+			case *proc.ErrProcessExited:
+				s.log.Debug(err)
+			default:
+				s.log.Error(err)
+			}
 		}
 	}
 }
@@ -575,7 +580,7 @@ func (s *Server) onLaunchRequest(request *dap.LaunchRequest) {
 }
 
 func (s *Server) runWithoutDebug(program string, targetArgs []string, wd string) error {
-	s.log.Println("Running without debug: ", program)
+	s.log.Debugln("Running without debug: ", program)
 
 	cmd := exec.Command(program, targetArgs...)
 	// TODO: send stdin/out/err as OutputEvent messages
@@ -597,7 +602,7 @@ func (s *Server) runWithoutDebug(program string, targetArgs []string, wd string)
 
 	// block until the process terminates.
 	if err := cmd.Wait(); err != nil {
-		s.log.Errorf("process exited with %v", err)
+		s.log.Debugf("process exited with %v", err)
 	}
 
 	s.mu.Lock()
@@ -616,7 +621,7 @@ func (s *Server) stopNoDebugProcess() {
 
 	// TODO(hyangah): gracefully terminate the process and its children processes.
 	if err := s.noDebugProcess.Process.Kill(); err != nil {
-		s.log.Errorf("killing process (pid=%v) failed: %v", s.noDebugProcess.Process.Pid, err)
+		s.log.Debugf("killing process (pid=%v) failed: %v", s.noDebugProcess.Process.Pid, err)
 	}
 }
 
@@ -638,7 +643,12 @@ func (s *Server) onDisconnectRequest(request *dap.DisconnectRequest) {
 	if s.debugger != nil {
 		_, err := s.debugger.Command(&api.DebuggerCommand{Name: api.Halt}, nil)
 		if err != nil {
-			s.log.Error(err)
+			switch err.(type) {
+			case *proc.ErrProcessExited:
+				s.log.Debug(err)
+			default:
+				s.log.Error(err)
+			}
 		}
 		// We always kill launched programs
 		kill := s.config.Debugger.AttachPid == 0
@@ -650,7 +660,12 @@ func (s *Server) onDisconnectRequest(request *dap.DisconnectRequest) {
 		}
 		err = s.debugger.Detach(kill)
 		if err != nil {
-			s.log.Error(err)
+			switch err.(type) {
+			case *proc.ErrProcessExited:
+				s.log.Debug(err)
+			default:
+				s.log.Error(err)
+			}
 		}
 	} else {
 		s.stopNoDebugProcess()
@@ -848,28 +863,44 @@ func (s *Server) onAttachRequest(request *dap.AttachRequest) {
 // onNextRequest handles 'next' request.
 // This is a mandatory request to support.
 func (s *Server) onNextRequest(request *dap.NextRequest) {
-	// This ignores threadId argument to match the original vscode-go implementation.
-	// TODO(polina): use SwitchGoroutine to change the current goroutine.
 	s.send(&dap.NextResponse{Response: *newResponse(request.Request)})
-	s.doCommand(api.Next)
+	s.doStepCommand(api.Next, request.Arguments.ThreadId)
 }
 
 // onStepInRequest handles 'stepIn' request
 // This is a mandatory request to support.
 func (s *Server) onStepInRequest(request *dap.StepInRequest) {
-	// This ignores threadId argument to match the original vscode-go implementation.
-	// TODO(polina): use SwitchGoroutine to change the current goroutine.
 	s.send(&dap.StepInResponse{Response: *newResponse(request.Request)})
-	s.doCommand(api.Step)
+	s.doStepCommand(api.Step, request.Arguments.ThreadId)
 }
 
 // onStepOutRequest handles 'stepOut' request
 // This is a mandatory request to support.
 func (s *Server) onStepOutRequest(request *dap.StepOutRequest) {
-	// This ignores threadId argument to match the original vscode-go implementation.
-	// TODO(polina): use SwitchGoroutine to change the current goroutine.
 	s.send(&dap.StepOutResponse{Response: *newResponse(request.Request)})
-	s.doCommand(api.StepOut)
+	s.doStepCommand(api.StepOut, request.Arguments.ThreadId)
+}
+
+func (s *Server) doStepCommand(command string, threadId int) {
+	// Use SwitchGoroutine to change the current goroutine.
+	state, err := s.debugger.Command(&api.DebuggerCommand{Name: api.SwitchGoroutine, GoroutineID: threadId}, nil)
+	if err != nil {
+		s.log.Errorf("Error switching goroutines while stepping: %e", err)
+		// If we encounter an error, we will have to send a stopped event
+		// since we already sent the step response.
+		stopped := &dap.StoppedEvent{Event: *newEvent("stopped")}
+		stopped.Body.AllThreadsStopped = true
+		if state.SelectedGoroutine != nil {
+			stopped.Body.ThreadId = state.SelectedGoroutine.ID
+		} else if state.CurrentThread != nil {
+			stopped.Body.ThreadId = state.CurrentThread.GoroutineID
+		}
+		stopped.Body.Reason = "error"
+		stopped.Body.Text = err.Error()
+		s.send(stopped)
+		return
+	}
+	s.doCommand(command)
 }
 
 // onPauseRequest sends a not-yet-implemented error response.
@@ -1417,7 +1448,7 @@ func (s *Server) onCancelRequest(request *dap.CancelRequest) {
 	s.sendNotYetImplementedErrorResponse(request.Request)
 }
 
-// sendERrorResponseWithOpts offers configuration options.
+// sendErrorResponseWithOpts offers configuration options.
 //   showUser - if true, the error will be shown to the user (e.g. via a visible pop-up)
 func (s *Server) sendErrorResponseWithOpts(request dap.Request, id int, summary, details string, showUser bool) {
 	er := &dap.ErrorResponse{}
@@ -1429,7 +1460,7 @@ func (s *Server) sendErrorResponseWithOpts(request dap.Request, id int, summary,
 	er.Body.Error.Id = id
 	er.Body.Error.Format = fmt.Sprintf("%s: %s", summary, details)
 	er.Body.Error.ShowUser = showUser
-	s.log.Error(er.Body.Error.Format)
+	s.log.Debug(er.Body.Error.Format)
 	s.send(er)
 }
 
@@ -1449,18 +1480,18 @@ func (s *Server) sendInternalErrorResponse(seq int, details string) {
 	er.Message = "Internal Error"
 	er.Body.Error.Id = InternalError
 	er.Body.Error.Format = fmt.Sprintf("%s: %s", er.Message, details)
-	s.log.Error(er.Body.Error.Format)
+	s.log.Debug(er.Body.Error.Format)
 	s.send(er)
 }
 
 func (s *Server) sendUnsupportedErrorResponse(request dap.Request) {
 	s.sendErrorResponse(request, UnsupportedCommand, "Unsupported command",
-		fmt.Sprintf("cannot process '%s' request", request.Command))
+		fmt.Sprintf("cannot process %q request", request.Command))
 }
 
 func (s *Server) sendNotYetImplementedErrorResponse(request dap.Request) {
 	s.sendErrorResponse(request, NotYetImplemented, "Not yet implemented",
-		fmt.Sprintf("cannot process '%s' request", request.Command))
+		fmt.Sprintf("cannot process %q request", request.Command))
 }
 
 func newResponse(request dap.Request) *dap.Response {
