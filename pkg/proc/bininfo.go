@@ -100,6 +100,12 @@ type BinaryInfo struct {
 	// function starts.
 	inlinedCallLines map[fileLine][]uint64
 
+	// dwrapUnwrapCache caches unwrapping of defer wrapper functions (dwrap)
+	dwrapUnwrapCache map[uint64]*Function
+
+	// Go 1.17 register ABI is enabled.
+	regabi bool
+
 	logger *logrus.Entry
 }
 
@@ -645,17 +651,19 @@ type Image struct {
 	closer         io.Closer
 	sepDebugCloser io.Closer
 
-	dwarf       *dwarf.Data
-	dwarfReader *dwarf.Reader
-	loclist2    *loclist.Dwarf2Reader
-	loclist5    *loclist.Dwarf5Reader
-	debugAddr   *godwarf.DebugAddrSection
+	dwarf        *dwarf.Data
+	dwarfReader  *dwarf.Reader
+	loclist2     *loclist.Dwarf2Reader
+	loclist5     *loclist.Dwarf5Reader
+	debugAddr    *godwarf.DebugAddrSection
+	debugLineStr []byte
 
 	typeCache map[dwarf.Offset]godwarf.Type
 
 	compileUnits []*compileUnit // compileUnits is sorted by increasing DWARF offset
 
-	dwarfTreeCache *simplelru.LRU
+	dwarfTreeCache      *simplelru.LRU
+	runtimeMallocgcTree *godwarf.Tree // patched version of runtime.mallocgc's DIE
 
 	// runtimeTypeToDIE maps between the offset of a runtime._type in
 	// runtime.moduledata.types and the offset of the DIE in debug_info. This
@@ -781,6 +789,9 @@ func (image *Image) LoadError() error {
 }
 
 func (image *Image) getDwarfTree(off dwarf.Offset) (*godwarf.Tree, error) {
+	if image.runtimeMallocgcTree != nil && off == image.runtimeMallocgcTree.Offset {
+		return image.runtimeMallocgcTree, nil
+	}
 	if r, ok := image.dwarfTreeCache.Get(off); ok {
 		return r.(*godwarf.Tree), nil
 	}
@@ -1202,6 +1213,8 @@ func loadBinaryInfoElf(bi *BinaryInfo, image *Image, path string, addr uint64, w
 	image.loclist5 = loclist.NewDwarf5Reader(debugLoclistBytes)
 	debugAddrBytes, _ := godwarf.GetDebugSectionElf(dwarfFile, "addr")
 	image.debugAddr = godwarf.ParseAddr(debugAddrBytes)
+	debugLineStrBytes, _ := godwarf.GetDebugSectionElf(dwarfFile, "line_str")
+	image.debugLineStr = debugLineStrBytes
 
 	wg.Add(3)
 	go bi.parseDebugFrameElf(image, dwarfFile, debugInfoBytes, wg)
@@ -1678,6 +1691,9 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 	if bi.inlinedCallLines == nil {
 		bi.inlinedCallLines = make(map[fileLine][]uint64)
 	}
+	if bi.dwrapUnwrapCache == nil {
+		bi.dwrapUnwrapCache = make(map[uint64]*Function)
+	}
 
 	image.runtimeTypeToDIE = make(map[uint64]runtimeTypeDIE)
 
@@ -1723,7 +1739,7 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 						logger.Printf(fmt, args)
 					}
 				}
-				cu.lineInfo = line.Parse(compdir, bytes.NewBuffer(debugLineBytes[lineInfoOffset:]), logfn, image.StaticBase, bi.GOOS == "windows", bi.Arch.PtrSize())
+				cu.lineInfo = line.Parse(compdir, bytes.NewBuffer(debugLineBytes[lineInfoOffset:]), image.debugLineStr, logfn, image.StaticBase, bi.GOOS == "windows", bi.Arch.PtrSize())
 			}
 			cu.producer, _ = entry.Val(dwarf.AttrProducer).(string)
 			if cu.isgo && cu.producer != "" {
@@ -1732,6 +1748,13 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 					cu.optimized = goversion.ProducerAfterOrEqual(cu.producer, 1, 10)
 				} else {
 					cu.optimized = !strings.Contains(cu.producer[semicolon:], "-N") || !strings.Contains(cu.producer[semicolon:], "-l")
+					const regabi = " regabi"
+					if i := strings.Index(cu.producer[semicolon:], regabi); i > 0 {
+						i += semicolon
+						if i+len(regabi) >= len(cu.producer) || cu.producer[i+len(regabi)] == ' ' {
+							bi.regabi = true
+						}
+					}
 					cu.producer = cu.producer[:semicolon]
 				}
 			}
@@ -1771,6 +1794,22 @@ func (bi *BinaryInfo) loadDebugInfoMaps(image *Image, debugInfoBytes, debugLineB
 	}
 	sort.Strings(bi.Sources)
 	bi.Sources = uniq(bi.Sources)
+
+	if bi.regabi {
+		// prepare patch for runtime.mallocgc's DIE
+		fn := bi.LookupFunc["runtime.mallocgc"]
+		if fn != nil {
+			tree, err := image.getDwarfTree(fn.offset)
+			if err == nil {
+				tree.Children, err = regabiMallocgcWorkaround(bi)
+				if err != nil {
+					bi.logger.Errorf("could not patch runtime.mallogc: %v", err)
+				} else {
+					image.runtimeMallocgcTree = tree
+				}
+			}
+		}
+	}
 
 	if cont != nil {
 		cont()

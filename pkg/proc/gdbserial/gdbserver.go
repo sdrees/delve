@@ -11,7 +11,7 @@
 // The protocol is specified at:
 //   https://sourceware.org/gdb/onlinedocs/gdb/Remote-Protocol.html
 // with additional documentation for lldb specific extensions described at:
-//   https://github.com/llvm-mirror/lldb/blob/master/docs/lldb-gdb-remote.txt
+//   https://github.com/llvm/llvm-project/blob/main/lldb/docs/lldb-gdb-remote.txt
 //
 // Terminology:
 //  * inferior: the program we are trying to debug
@@ -82,6 +82,7 @@ import (
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
 	"github.com/go-delve/delve/pkg/proc/linutil"
+	"github.com/go-delve/delve/pkg/proc/macutil"
 	isatty "github.com/mattn/go-isatty"
 )
 
@@ -431,6 +432,9 @@ func LLDBLaunch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs [
 	if runtime.GOOS == "windows" {
 		return nil, ErrUnsupportedOS
 	}
+	if err := macutil.CheckRosetta(); err != nil {
+		return nil, err
+	}
 
 	foreground := flags&proc.LaunchForeground != 0
 
@@ -547,6 +551,9 @@ func LLDBLaunch(cmd []string, wd string, flags proc.LaunchFlags, debugInfoDirs [
 func LLDBAttach(pid int, path string, debugInfoDirs []string) (*proc.Target, error) {
 	if runtime.GOOS == "windows" {
 		return nil, ErrUnsupportedOS
+	}
+	if err := macutil.CheckRosetta(); err != nil {
+		return nil, err
 	}
 
 	var (
@@ -1853,8 +1860,11 @@ func (t *gdbThread) SetReg(regNum uint64, reg *op.DwarfRegister) error {
 	gdbreg, ok := t.regs.regs[regName]
 	if !ok && strings.HasPrefix(regName, "xmm") {
 		// XMMn and YMMn are the same amd64 register (in different sizes), if we
-		// don't find XMMn try YMMn instead.
+		// don't find XMMn try YMMn or ZMMn instead.
 		gdbreg, ok = t.regs.regs["y"+regName[1:]]
+		if !ok {
+			gdbreg, ok = t.regs.regs["z"+regName[1:]]
+		}
 	}
 	if !ok {
 		return fmt.Errorf("could not set register %s: not found", regName)
@@ -1913,8 +1923,16 @@ func (regs *gdbRegisters) Slice(floatingPoint bool) ([]proc.Register, error) {
 
 			value := regs.regs[reginfo.Name].value
 			xmmName := "x" + reginfo.Name[1:]
-			r = proc.AppendBytesRegister(r, strings.ToUpper(xmmName), value[:16])
-			r = proc.AppendBytesRegister(r, strings.ToUpper(reginfo.Name), value[16:])
+			r = proc.AppendBytesRegister(r, strings.ToUpper(xmmName), value)
+
+		case reginfo.Bitsize == 512:
+			if !strings.HasPrefix(strings.ToLower(reginfo.Name), "zmm") || !floatingPoint {
+				continue
+			}
+
+			value := regs.regs[reginfo.Name].value
+			xmmName := "x" + reginfo.Name[1:]
+			r = proc.AppendBytesRegister(r, strings.ToUpper(xmmName), value)
 		}
 	}
 	return r, nil

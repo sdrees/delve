@@ -682,7 +682,7 @@ func checkVar(t *testing.T, got *dap.VariablesResponse, i int, name, evalName, v
 		}
 	}
 	if i < 0 {
-		t.Errorf("\ngot  %#v\nwant Variables[i].Name=%q", got, name)
+		t.Errorf("\ngot  %#v\nwant Variables[i].Name=%q (not found)", got, name)
 		return 0
 	}
 
@@ -1379,7 +1379,7 @@ func TestScopesAndVariablesRequests2(t *testing.T) {
 					checkVarExact(t, locals, -1, "emptyslice", "emptyslice", "[]string len: 0, cap: 0, []", "[]string", noChildren)
 					checkVarExact(t, locals, -1, "nilslice", "nilslice", "[]int len: 0, cap: 0, nil", "[]int", noChildren)
 					// reflect.Kind == String
-					checkVarExact(t, locals, -1, "longstr", "longstr", `"very long string 0123456789a0123456789b0123456789c0123456789d012...+73 more"`, "string", noChildren)
+					checkVarExact(t, locals, -1, "longstr", "longstr", longstr, "string", noChildren)
 					// reflect.Kind == Struct
 					checkVarExact(t, locals, -1, "zsvar", "zsvar", "struct {} {}", "struct {}", noChildren)
 					// reflect.Kind == UnsafePointer
@@ -1476,8 +1476,12 @@ func TestVariablesLoading(t *testing.T) {
 			}, {
 				execute: func() {
 					// Change default config values to trigger certain unloaded corner cases
+					saveDefaultConfig := DefaultLoadConfig
 					DefaultLoadConfig.MaxStructFields = 5
-					defer func() { DefaultLoadConfig.MaxStructFields = -1 }()
+					DefaultLoadConfig.MaxStringLen = 64
+					defer func() {
+						DefaultLoadConfig = saveDefaultConfig
+					}()
 
 					client.StackTraceRequest(1, 0, 0)
 					client.ExpectStackTraceResponse(t)
@@ -1489,7 +1493,8 @@ func TestVariablesLoading(t *testing.T) {
 					locals := client.ExpectVariablesResponse(t)
 
 					// String partially missing based on LoadConfig.MaxStringLen
-					checkVarExact(t, locals, -1, "longstr", "longstr", "\"very long string 0123456789a0123456789b0123456789c0123456789d012...+73 more\"", "string", noChildren)
+					// See also TestVariableLoadingOfLongStrings
+					checkVarExact(t, locals, -1, "longstr", "longstr", longstrLoaded64, "string", noChildren)
 
 					checkArrayChildren := func(t *testing.T, longarr *dap.VariablesResponse, parentName string, start int) {
 						t.Helper()
@@ -1519,7 +1524,6 @@ func TestVariablesLoading(t *testing.T) {
 						longarr = client.ExpectVariablesResponse(t)
 						checkChildren(t, longarr, "longarr", 50)
 						checkArrayChildren(t, longarr, "longarr", 50)
-
 					}
 
 					// Slice not fully loaded based on LoadConfig.MaxArrayValues.
@@ -1784,6 +1788,89 @@ func TestVariablesLoading(t *testing.T) {
 	})
 }
 
+// TestVariablesMetadata exposes test cases where variables contain metadata that
+// can be accessed by requesting named variables.
+func TestVariablesMetadata(t *testing.T) {
+	runTest(t, "testvariables2", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Breakpoints are set within the program
+			fixture.Source, []int{},
+			[]onBreakpoint{{
+				execute:    func() {},
+				disconnect: false,
+			}, {
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 368)
+
+					client.VariablesRequest(1001) // Locals
+					locals := client.ExpectVariablesResponse(t)
+
+					checkNamedChildren := func(ref int, name, typeStr string, vals []string, evaluate bool) {
+						// byteslice, request named variables
+						client.NamedVariablesRequest(ref)
+						named := client.ExpectVariablesResponse(t)
+						checkChildren(t, named, name, 1)
+						checkVarExact(t, named, 0, "string()", "", "\"tèst\"", "string", false)
+
+						client.VariablesRequest(ref)
+						all := client.ExpectVariablesResponse(t)
+						checkChildren(t, all, name, len(vals)+1)
+						checkVarExact(t, all, 0, "string()", "", "\"tèst\"", "string", false)
+						for i, v := range vals {
+							idx := fmt.Sprintf("[%d]", i)
+							evalName := fmt.Sprintf("%s[%d]", name, i)
+							if evaluate {
+								evalName = fmt.Sprintf("(%s)[%d]", name, i)
+							}
+							checkVarExact(t, all, i+1, idx, evalName, v, typeStr, false)
+						}
+					}
+
+					// byteslice
+					ref := checkVarExactIndexed(t, locals, -1, "byteslice", "byteslice", "[]uint8 len: 5, cap: 5, [116,195,168,115,116]", "[]uint8", true, 5, 1)
+					checkNamedChildren(ref, "byteslice", "uint8", []string{"116", "195", "168", "115", "116"}, false)
+
+					client.EvaluateRequest("byteslice", 0, "")
+					got := client.ExpectEvaluateResponse(t)
+					ref = checkEvalIndexed(t, got, "[]uint8 len: 5, cap: 5, [116,195,168,115,116]", hasChildren, 5, 1)
+					checkNamedChildren(ref, "byteslice", "uint8", []string{"116", "195", "168", "115", "116"}, true)
+
+					// runeslice
+					ref = checkVarExactIndexed(t, locals, -1, "runeslice", "runeslice", "[]int32 len: 4, cap: 4, [116,232,115,116]", "[]int32", true, 4, 1)
+					checkNamedChildren(ref, "runeslice", "int32", []string{"116", "232", "115", "116"}, false)
+
+					client.EvaluateRequest("runeslice", 0, "repl")
+					got = client.ExpectEvaluateResponse(t)
+					ref = checkEvalIndexed(t, got, "[]int32 len: 4, cap: 4, [116,232,115,116]", hasChildren, 4, 1)
+					checkNamedChildren(ref, "runeslice", "int32", []string{"116", "232", "115", "116"}, true)
+
+					// bytearray
+					ref = checkVarExactIndexed(t, locals, -1, "bytearray", "bytearray", "[5]uint8 [116,195,168,115,116]", "[5]uint8", true, 5, 1)
+					checkNamedChildren(ref, "bytearray", "uint8", []string{"116", "195", "168", "115", "116"}, false)
+
+					client.EvaluateRequest("bytearray", 0, "hover")
+					got = client.ExpectEvaluateResponse(t)
+					ref = checkEvalIndexed(t, got, "[5]uint8 [116,195,168,115,116]", hasChildren, 5, 1)
+					checkNamedChildren(ref, "bytearray", "uint8", []string{"116", "195", "168", "115", "116"}, true)
+
+					// runearray
+					ref = checkVarExactIndexed(t, locals, -1, "runearray", "runearray", "[4]int32 [116,232,115,116]", "[4]int32", true, 4, 1)
+					checkNamedChildren(ref, "runearray", "int32", []string{"116", "232", "115", "116"}, false)
+
+					client.EvaluateRequest("runearray", 0, "watch")
+					got = client.ExpectEvaluateResponse(t)
+					ref = checkEvalIndexed(t, got, "[4]int32 [116,232,115,116]", hasChildren, 4, 1)
+					checkNamedChildren(ref, "runearray", "int32", []string{"116", "232", "115", "116"}, true)
+				},
+				disconnect: true,
+			}})
+	})
+}
+
 // TestGlobalScopeAndVariables launches the program with showGlobalVariables
 // arg set, executes to a breakpoint in the main package and tests that global
 // package main variables got loaded. It then steps into a function
@@ -1942,7 +2029,7 @@ func checkBreakpoints(t *testing.T, client *daptest.Client, bps []Breakpoint, br
 	}
 	for i, bp := range breakpoints {
 		if bps[i].line < 0 && !bps[i].verified {
-			if bp.Verified != bps[i].verified || !strings.Contains(bp.Message, bps[i].msgPrefix) {
+			if bp.Verified != bps[i].verified || !stringContainsCaseInsensitive(bp.Message, bps[i].msgPrefix) {
 				t.Errorf("got breakpoints[%d] = %#v, \nwant %#v", i, bp, bps[i])
 			}
 			continue
@@ -1985,7 +2072,7 @@ func TestSetBreakpoint(t *testing.T) {
 
 					// Set another breakpoint inside the loop in loop(), twice to trigger error
 					client.SetBreakpointsRequest(fixture.Source, []int{8, 8})
-					expectSetBreakpointsResponse(t, client, []Breakpoint{{8, fixture.Source, true, ""}, {-1, "", false, "Breakpoint exists"}})
+					expectSetBreakpointsResponse(t, client, []Breakpoint{{8, fixture.Source, true, ""}, {-1, "", false, "breakpoint exists"}})
 
 					// Continue into the loop
 					client.ContinueRequest(1)
@@ -2032,6 +2119,72 @@ func TestSetBreakpoint(t *testing.T) {
 	})
 }
 
+func checkHitBreakpointIds(t *testing.T, se *dap.StoppedEvent, reason string, id int) {
+	if se.Body.ThreadId != 1 || se.Body.Reason != reason || len(se.Body.HitBreakpointIds) != 1 || se.Body.HitBreakpointIds[0] != id {
+		t.Errorf("got %#v, want Reason=%q, ThreadId=1, HitBreakpointIds=[]int{%d}", se, reason, id)
+	}
+}
+
+// TestHitBreakpointIds executes to a breakpoint and tests that
+// the breakpoint ids in the stopped event are correct.
+func TestHitBreakpointIds(t *testing.T) {
+	runTest(t, "locationsprog", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{30}, // b main.main
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 30)
+
+					// Set two source breakpoints and two function breakpoints.
+					client.SetBreakpointsRequest(fixture.Source, []int{23, 33})
+					sourceBps := client.ExpectSetBreakpointsResponse(t).Body.Breakpoints
+					checkBreakpoints(t, client, []Breakpoint{{line: 23, path: fixture.Source, verified: true}, {line: 33, path: fixture.Source, verified: true}}, sourceBps)
+
+					client.SetFunctionBreakpointsRequest([]dap.FunctionBreakpoint{
+						{Name: "anotherFunction"},
+						{Name: "anotherFunction:1"},
+					})
+					functionBps := client.ExpectSetFunctionBreakpointsResponse(t).Body.Breakpoints
+					checkBreakpoints(t, client, []Breakpoint{{line: 26, path: fixture.Source, verified: true}, {line: 27, path: fixture.Source, verified: true}}, functionBps)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+					se := client.ExpectStoppedEvent(t)
+					checkHitBreakpointIds(t, se, "breakpoint", sourceBps[1].Id)
+					checkStop(t, client, 1, "main.main", 33)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+					se = client.ExpectStoppedEvent(t)
+					checkHitBreakpointIds(t, se, "breakpoint", sourceBps[0].Id)
+					checkStop(t, client, 1, "main.(*SomeType).SomeFunction", 23)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+					se = client.ExpectStoppedEvent(t)
+					checkHitBreakpointIds(t, se, "function breakpoint", functionBps[0].Id)
+					checkStop(t, client, 1, "main.anotherFunction", 26)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+					se = client.ExpectStoppedEvent(t)
+					checkHitBreakpointIds(t, se, "function breakpoint", functionBps[1].Id)
+					checkStop(t, client, 1, "main.anotherFunction", 27)
+				},
+				disconnect: true,
+			}})
+	})
+}
+
+func stringContainsCaseInsensitive(got, want string) bool {
+	return strings.Contains(strings.ToLower(got), strings.ToLower(want))
+}
+
 // TestSetFunctionBreakpoints is inspired by service/test.TestClientServer_FindLocations.
 func TestSetFunctionBreakpoints(t *testing.T) {
 	runTest(t, "locationsprog", func(client *daptest.Client, fixture protest.Fixture) {
@@ -2061,7 +2214,7 @@ func TestSetFunctionBreakpoints(t *testing.T) {
 						}
 						for i, bp := range got.Body.Breakpoints {
 							if bps[i].line < 0 && !bps[i].verified {
-								if bp.Verified != bps[i].verified || !strings.Contains(bp.Message, bps[i].errMsg) {
+								if bp.Verified != bps[i].verified || !stringContainsCaseInsensitive(bp.Message, bps[i].errMsg) {
 									t.Errorf("got breakpoints[%d] = %#v, \nwant %#v", i, bp, bps[i])
 								}
 								continue
@@ -2208,7 +2361,7 @@ func TestSetFunctionBreakpoints(t *testing.T) {
 					client.SetFunctionBreakpointsRequest([]dap.FunctionBreakpoint{
 						{Name: "SomeType.String"}, {Name: "(*SomeType).String"},
 					})
-					expectSetFunctionBreakpointsResponse([]Breakpoint{{14, filepath.Base(fixture.Source), true, ""}, {-1, "", false, "Breakpoint exists"}})
+					expectSetFunctionBreakpointsResponse([]Breakpoint{{14, filepath.Base(fixture.Source), true, ""}, {-1, "", false, "breakpoint exists"}})
 
 					// Set two breakpoints at SomeType.String and SomeType.SomeFunction.
 					client.SetFunctionBreakpointsRequest([]dap.FunctionBreakpoint{
@@ -2622,9 +2775,14 @@ func TestWorkingDir(t *testing.T) {
 					client.VariablesRequest(1001) // Locals
 					locals := client.ExpectVariablesResponse(t)
 					checkChildren(t, locals, "Locals", 2)
-					checkVarExact(t, locals, 0, "pwd", "pwd", fmt.Sprintf("%q", wd), "string", noChildren)
-					checkVarExact(t, locals, 1, "err", "err", "error nil", "error", noChildren)
-
+					for i := range locals.Body.Variables {
+						switch locals.Body.Variables[i].Name {
+						case "pwd":
+							checkVarExact(t, locals, i, "pwd", "pwd", fmt.Sprintf("%q", wd), "string", noChildren)
+						case "err":
+							checkVarExact(t, locals, i, "err", "err", "error nil", "error", noChildren)
+						}
+					}
 				},
 				disconnect: false,
 			}})
@@ -2827,7 +2985,7 @@ func TestEvaluateRequest(t *testing.T) {
 // From testvariables2 fixture
 const (
 	// As defined in the code
-	longstrFull = `"very long string 0123456789a0123456789b0123456789c0123456789d0123456789e0123456789f0123456789g012345678h90123456789i0123456789j0123456789"`
+	longstr = `"very long string 0123456789a0123456789b0123456789c0123456789d0123456789e0123456789f0123456789g012345678h90123456789i0123456789j0123456789"`
 	// Loaded with MaxStringLen=64
 	longstrLoaded64   = `"very long string 0123456789a0123456789b0123456789c0123456789d012...+73 more"`
 	longstrLoaded64re = `\"very long string 0123456789a0123456789b0123456789c0123456789d012\.\.\.\+73 more\"`
@@ -2880,28 +3038,27 @@ func TestVariableValueTruncation(t *testing.T) {
 
 					// Compound map keys may be truncated even further
 					// As the keys are always inside of a map container,
-					// this applies to variable requests.
+					// this applies to variables requests only, not evalute requests.
 
 					// key - compound, value - scalar (inlined key:value display) => truncate key if too long
-					ref := checkVarExact(t, locals, -1, "m5", "m5", "map[main.C]int [{s: "+longstrLoaded64+"}: 1, ]", "map[main.C]int", hasChildren)
+					ref := checkVarExact(t, locals, -1, "m5", "m5", "map[main.C]int [{s: "+longstr+"}: 1, ]", "map[main.C]int", hasChildren)
 					if ref > 0 {
 						client.VariablesRequest(ref)
 						// Key format: <truncated>... @<address>
 						checkVarRegex(t, client.ExpectVariablesResponse(t), 0, `main\.C {s: "very long string 0123456789.+\.\.\. @ 0x[0-9a-f]+`, `m5\[\(\*\(\*"main\.C"\)\(0x[0-9a-f]+\)\)\]`, "1", `int`, hasChildren)
 					}
-					// key - scalar, value - scalar (inlined key:value display) => not truncated
-					ref = checkVarExact(t, locals, -1, "m6", "m6", "map[string]int ["+longstrLoaded64+": 123, ]", "map[string]int", hasChildren)
+					// key - scalar, value - scalar (inlined key:value display) => key not truncated
+					ref = checkVarExact(t, locals, -1, "m6", "m6", "map[string]int ["+longstr+": 123, ]", "map[string]int", hasChildren)
 					if ref > 0 {
 						client.VariablesRequest(ref)
-						checkVarRegex(t, client.ExpectVariablesResponse(t), 0, longstrLoaded64re, `m6[\(\*\(\*\"string\"\)\(0x[0-9a-f]+\)\)]`, "123", "string: int", noChildren)
+						checkVarExact(t, client.ExpectVariablesResponse(t), 0, longstr, `m6[`+longstr+`]`, "123", "string: int", noChildren)
 					}
-					// key - compound, value - compound (array-like display) => not truncated
-					ref = checkVarExact(t, locals, -1, "m7", "m7", "map[main.C]main.C [{s: "+longstrLoaded64+"}: {s: "+longstrLoaded64+"}, ]", "map[main.C]main.C", hasChildren)
+					// key - compound, value - compound (array-like display) => key not truncated
+					ref = checkVarExact(t, locals, -1, "m7", "m7", "map[main.C]main.C [{s: "+longstr+"}: {s: \"hello\"}, ]", "map[main.C]main.C", hasChildren)
 					if ref > 0 {
 						client.VariablesRequest(ref)
 						m7 := client.ExpectVariablesResponse(t)
-						checkVarRegex(t, m7, 0, "[key 0]", `\(\*\(\*\"main\.C\"\)\(0x[0-9a-f]+\)\)`, `main\.C {s: `+longstrLoaded64re+`}`, `main\.C`, hasChildren)
-						checkVarRegex(t, m7, 1, "[val 0]", `\(\*\(\*\"main\.C\"\)\(0x[0-9a-f]+\)\)`, `main\.C {s: `+longstrLoaded64re+`}`, `main\.C`, hasChildren)
+						checkVarRegex(t, m7, 0, "[key 0]", `\(\*\(\*\"main\.C\"\)\(0x[0-9a-f]+\)\)`, `main\.C {s: `+longstr+`}`, `main\.C`, hasChildren)
 					}
 				},
 				disconnect: true,
@@ -2909,16 +3066,17 @@ func TestVariableValueTruncation(t *testing.T) {
 	})
 }
 
-// TestVariableLoadingOfLargeStrings tests that different string loading limits
+// TestVariableLoadingOfLongStrings tests that different string loading limits
 // apply that depending on the context.
-func TestVariableLoadingOfLargeStrings(t *testing.T) {
-	runTest(t, "testvariables2", func(client *daptest.Client, fixture protest.Fixture) {
+func TestVariableLoadingOfLongStrings(t *testing.T) {
+	protest.MustSupportFunctionCalls(t, testBackend)
+	runTest(t, "longstrings", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
 			func() {
 				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
 			},
-			// Breakpoints are set within the program
+			// Breakpoint set within the program
 			fixture.Source, []int{},
 			[]onBreakpoint{{
 				execute: func() {
@@ -2927,29 +3085,56 @@ func TestVariableLoadingOfLargeStrings(t *testing.T) {
 					client.VariablesRequest(1001) // Locals
 					locals := client.ExpectVariablesResponse(t)
 
-					// Limits vary for evaluate requests
-					for _, evalContext := range []string{"", "watch", "repl", "variables", "hover", "clipboard", "somethingelse"} {
-						t.Run(evalContext, func(t *testing.T) {
-							// long string by itself (limits vary)
-							client.EvaluateRequest("longstr", 0, evalContext)
-							got := client.ExpectEvaluateResponse(t)
-							want := longstrLoaded64
-							switch evalContext {
-							case "repl", "variables", "hover", "clipboard":
-								want = longstrFull
-							}
-							checkEval(t, got, want, false)
+					// Limits vary for evaluate requests with different contexts
+					tests := []struct {
+						context string
+						limit   int
+					}{
+						{"", DefaultLoadConfig.MaxStringLen},
+						{"watch", DefaultLoadConfig.MaxStringLen},
+						{"repl", maxSingleStringLen},
+						{"hover", maxSingleStringLen},
+						{"variables", maxSingleStringLen},
+						{"clipboard", maxSingleStringLen},
+						{"somethingelse", DefaultLoadConfig.MaxStringLen},
+					}
+					for _, tc := range tests {
+						t.Run(tc.context, func(t *testing.T) {
+							// Long string by itself (limits vary)
+							client.EvaluateRequest("s4097", 0, tc.context)
+							want := fmt.Sprintf(`"x+\.\.\.\+%d more"`, 4097-tc.limit)
+							checkEvalRegex(t, client.ExpectEvaluateResponse(t), want, noChildren)
 
-							// long string as a child (same limits)
-							client.EvaluateRequest("(cl).s", 0, evalContext)
-							got2 := client.ExpectEvaluateResponse(t)
-							checkEval(t, got2, want, false)
+							// Evaluated container variables return values with minimally loaded
+							// strings, which are further truncated for displaying, so we
+							// can't test for loading limit except in contexts where an untruncated
+							// value is returned.
+							client.EvaluateRequest("&s4097", 0, tc.context)
+							switch tc.context {
+							case "variables", "clipboard":
+								want = fmt.Sprintf(`\*"x+\.\.\.\+%d more`, 4097-DefaultLoadConfig.MaxStringLen)
+							default:
+								want = fmt.Sprintf(`\*"x{%d}\.\.\.`, maxVarValueLen-2)
+							}
+							checkEvalRegex(t, client.ExpectEvaluateResponse(t), want, hasChildren)
 						})
 					}
 
-					// Variables requests are not affected.
-					checkVarExact(t, locals, -1, "longstr", "longstr", longstrLoaded64, "string", noChildren)
-					checkVarExact(t, locals, -1, "cl", "cl", `main.C {s: `+longstrLoaded64+`}`, "main.C", hasChildren)
+					// Long strings returned from calls are subject to a different limit,
+					// same limit regardless of context
+					for _, context := range []string{"", "watch", "repl", "variables", "hover", "clipboard", "somethingelse"} {
+						t.Run(context, func(t *testing.T) {
+							client.EvaluateRequest(`call buildString(4097)`, 1000, context)
+							want := fmt.Sprintf(`"x+\.\.\.\+%d more"`, 4097-maxStringLenInCallRetVars)
+							got := client.ExpectEvaluateResponse(t)
+							checkEvalRegex(t, got, want, hasChildren)
+						})
+					}
+
+					// Variables requests use the most conservative loading limit
+					checkVarRegex(t, locals, -1, "s513", "s513", `"x{512}\.\.\.\+1 more"`, "string", noChildren)
+					// Container variables are subject to additional stricter value truncation that drops +more part
+					checkVarRegex(t, locals, -1, "nested", "nested", `map\[int\]string \[513: \"x+\.\.\.`, "string", hasChildren)
 				},
 				disconnect: true,
 			}})
@@ -3030,7 +3215,7 @@ func TestEvaluateCallRequest(t *testing.T) {
 				disconnect: false,
 			}, { // Stop at runtime breakpoint
 				execute: func() {
-					checkStop(t, client, 1, "main.main", 197)
+					checkStop(t, client, 1, "main.main", -1)
 
 					// No return values
 					client.EvaluateRequest("call call0(1, 2)", 1000, "this context will be ignored")
@@ -3086,13 +3271,6 @@ func TestEvaluateCallRequest(t *testing.T) {
 					client.EvaluateRequest("call ", 1000, "watch")
 					got = client.ExpectEvaluateResponse(t)
 					checkEval(t, got, "\"this is a variable named `call`\"", noChildren)
-					// Long string as a return value
-					client.EvaluateRequest(`call stringsJoin(longstrs, ",")`, 1000, "variables") // full string
-					got = client.ExpectEvaluateResponse(t)
-					checkEval(t, got, `"very long string 0123456789a0123456789b0123456789c0123456789d0123456789e0123456789f0123456789g012345678h90123456789i0123456789j0123456789"`, hasChildren)
-					client.EvaluateRequest(`call stringsJoin(longstrs, ",")`, 1000, "watch") // full string
-					got = client.ExpectEvaluateResponse(t)
-					checkEval(t, got, `"very long string 0123456789a0123456789b0123456789c0123456789d0123456789e0123456789f0123456789g012345678h90123456789i0123456789j0123456789"`, hasChildren)
 
 					// Call error
 					client.EvaluateRequest("call call1(one)", 1000, "watch")
@@ -3328,13 +3506,19 @@ func TestStepOutPreservesGoroutine(t *testing.T) {
 					if len(bestg) > 0 {
 						goroutineId = bestg[rand.Intn(len(bestg))]
 						t.Logf("selected goroutine %d (best)\n", goroutineId)
-					} else {
+					} else if len(candg) > 0 {
 						goroutineId = candg[rand.Intn(len(candg))]
 						t.Logf("selected goroutine %d\n", goroutineId)
 
 					}
-					client.StepOutRequest(goroutineId)
-					client.ExpectStepOutResponse(t)
+
+					if goroutineId != 0 {
+						client.StepOutRequest(goroutineId)
+						client.ExpectStepOutResponse(t)
+					} else {
+						client.ContinueRequest(-1)
+						client.ExpectContinueResponse(t)
+					}
 
 					switch e := client.ExpectMessage(t).(type) {
 					case *dap.StoppedEvent:
@@ -3379,7 +3563,6 @@ func TestBadAccess(t *testing.T) {
 						if eInfo.Body.ExceptionId != "runtime error" || !strings.HasPrefix(eInfo.Body.Description, errorPrefix) {
 							t.Errorf("\ngot  %#v\nwant ExceptionId=\"runtime error\" Text=\"%s\"", eInfo, errorPrefix)
 						}
-
 					}
 
 					client.ContinueRequest(1)
@@ -3491,6 +3674,41 @@ func TestPanicBreakpointOnNext(t *testing.T) {
 }
 
 func TestFatalThrowBreakpoint(t *testing.T) {
+	runTest(t, "fatalerror", func(client *daptest.Client, fixture protest.Fixture) {
+		runDebugSessionWithBPs(t, client, "launch",
+			// Launch
+			func() {
+				client.LaunchRequest("exec", fixture.Path, !stopOnEntry)
+			},
+			// Set breakpoints
+			fixture.Source, []int{3},
+			[]onBreakpoint{{
+				execute: func() {
+					checkStop(t, client, 1, "main.main", 3)
+
+					client.ContinueRequest(1)
+					client.ExpectContinueResponse(t)
+
+					se := client.ExpectStoppedEvent(t)
+					if se.Body.ThreadId != 1 || se.Body.Reason != "exception" || se.Body.Description != "fatal error" {
+						t.Errorf("\ngot  %#v\nwant ThreadId=1 Reason=\"exception\" Description=\"fatal error\"", se)
+					}
+
+					// TODO(suzmue): Enable this test for 1.17 when https://github.com/golang/go/issues/46425 is fixed.
+					errorPrefix := "\"go of nil func value\""
+					if goversion.VersionAfterOrEqual(runtime.Version(), 1, 16) {
+						errorPrefix = "Throw reason unavailable, see https://github.com/golang/go/issues/46425"
+					}
+					client.ExceptionInfoRequest(1)
+					eInfo := client.ExpectExceptionInfoResponse(t)
+					if eInfo.Body.ExceptionId != "fatal error" || !strings.HasPrefix(eInfo.Body.Description, errorPrefix) {
+						t.Errorf("\ngot  %#v\nwant ExceptionId=\"runtime error\" Text=%s", eInfo, errorPrefix)
+					}
+
+				},
+				disconnect: true,
+			}})
+	})
 	runTest(t, "testdeadlock", func(client *daptest.Client, fixture protest.Fixture) {
 		runDebugSessionWithBPs(t, client, "launch",
 			// Launch
@@ -3510,6 +3728,10 @@ func TestFatalThrowBreakpoint(t *testing.T) {
 					if se.Body.Reason != "exception" || se.Body.Description != "fatal error" {
 						t.Errorf("\ngot  %#v\nwant Reason=\"exception\" Description=\"fatal error\"", se)
 					}
+
+					// TODO(suzmue): Get the exception info for the thread and check the description
+					// includes "all goroutines are asleep - deadlock!".
+					// Stopped events with no selected goroutines need to be supported to test deadlock.
 				},
 				disconnect: true,
 			}})
@@ -3676,7 +3898,7 @@ func TestLaunchDebugRequest(t *testing.T) {
 		// BinaryInfo.Close(), but it appears that it is still in use (by Windows?)
 		// shortly after. gobuild.Remove has a delay to address this, but
 		// to avoid any test flakiness we guard against this failure here as well.
-		if runtime.GOOS != "windows" || !strings.Contains(rmErr, "Access is denied") {
+		if runtime.GOOS != "windows" || !stringContainsCaseInsensitive(rmErr, "Access is denied") {
 			t.Fatalf("Binary removal failure:\n%s\n", rmErr)
 		}
 	} else {
@@ -3989,7 +4211,7 @@ func (h *helperForSetVariable) failSetVariable0(ref int, name, value, wantErrInf
 		h.c.ExpectStoppedEvent(h.t)
 	}
 	resp := h.c.ExpectErrorResponse(h.t)
-	if got := resp.Body.Error.Format; !strings.Contains(got, wantErrInfo) {
+	if got := resp.Body.Error.Format; !stringContainsCaseInsensitive(got, wantErrInfo) {
 		h.t.Errorf("got %#v, want error string containing %v", got, wantErrInfo)
 	}
 }
@@ -4279,7 +4501,7 @@ func TestSetVariableWithCall(t *testing.T) {
 				execute: func() {
 					tester := &helperForSetVariable{t, client}
 
-					checkStop(t, client, 1, "main.main", 197)
+					checkStop(t, client, 1, "main.main", -1)
 
 					_ = tester.variables(1001)
 
@@ -4288,7 +4510,7 @@ func TestSetVariableWithCall(t *testing.T) {
 					tester.evaluateRegex("str", `.*in main.callstacktrace at.*`, noChildren)
 
 					tester.failSetVariableAndStop(1001, "str", `callpanic()`, `callpanic panicked`)
-					checkStop(t, client, 1, "main.main", 197)
+					checkStop(t, client, 1, "main.main", -1)
 
 					// breakpoint during a function call.
 					tester.failSetVariableAndStop(1001, "str", `callbreak()`, "call stopped")
@@ -4658,7 +4880,7 @@ func TestBadlyFormattedMessageToServer(t *testing.T) {
 	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
 		// Send a badly formatted message to the server, and expect it to close the
 		// connection.
-		client.UnknownRequest()
+		client.BadRequest()
 		time.Sleep(100 * time.Millisecond)
 
 		_, err := client.ReadMessage()
@@ -4666,5 +4888,18 @@ func TestBadlyFormattedMessageToServer(t *testing.T) {
 		if err != io.EOF {
 			t.Errorf("got err=%v, want io.EOF", err)
 		}
+	})
+	runTest(t, "increment", func(client *daptest.Client, fixture protest.Fixture) {
+		// Send an unknown request message to the server, and expect it to send
+		// an error response.
+		client.UnknownRequest()
+		err := client.ExpectErrorResponse(t)
+		if err.Body.Error.Format != "Internal Error: Request command 'unknown' is not supported (seq: 1)" || err.RequestSeq != 1 {
+			t.Errorf("got %v, want  RequestSeq=1 Error=\"Internal Error: Request command 'unknown' is not supported (seq: 1)\"", err)
+		}
+
+		// Make sure that the unknown request did not kill the server.
+		client.InitializeRequest()
+		client.ExpectInitializeResponse(t)
 	})
 }

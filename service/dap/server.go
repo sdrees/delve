@@ -29,6 +29,7 @@ import (
 	"sync"
 
 	"github.com/go-delve/delve/pkg/gobuild"
+	"github.com/go-delve/delve/pkg/goversion"
 	"github.com/go-delve/delve/pkg/locspec"
 	"github.com/go-delve/delve/pkg/logflags"
 	"github.com/go-delve/delve/pkg/proc"
@@ -165,17 +166,30 @@ type dapClientCapabilites struct {
 	supportsProgressReporting    bool
 }
 
-// DefaultLoadConfig controls how variables are loaded from the target's memory, borrowing the
-// default value from the original vscode-go debug adapter and rpc server.
-// With dlv-dap, users currently do not have a way to adjust these.
-// TODO(polina): Support setting config via launch/attach args or only rely on on-demand loading?
+// DefaultLoadConfig controls how variables are loaded from the target's memory.
+// These limits are conservative to minimize performace overhead for bulk loading.
+// With dlv-dap, users do not have a way to adjust these.
+// Instead we are focusing in interacive loading with nested reloads, array/map
+// paging and context-specific string limits.
 var DefaultLoadConfig = proc.LoadConfig{
 	FollowPointers:     true,
 	MaxVariableRecurse: 1,
-	MaxStringLen:       64,
-	MaxArrayValues:     64,
-	MaxStructFields:    -1,
+	// TODO(polina): consider 1024 limit instead:
+	// - vscode+C appears to use 1024 as the load limit
+	// - vscode viewlet hover truncates at 1023 characters
+	MaxStringLen:    512,
+	MaxArrayValues:  64,
+	MaxStructFields: -1,
 }
+
+const (
+	// When a user examines a single string, we can relax the loading limit.
+	maxSingleStringLen = 4 << 10 // 4096
+	// Results of a call are single-use and transient. We need to maximize
+	// what is presented. A common use case of a call injection is to
+	// stringify complex data conveniently.
+	maxStringLenInCallRetVars = 1 << 10 // 1024
+)
 
 // NewServer creates a new DAP Server. It takes an opened Listener
 // via config and assumes its ownership. config.DisconnectChan has to be set;
@@ -255,13 +269,6 @@ func (s *Server) Stop() {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.conn != nil {
-		// Unless Stop() was called after serveDAPCodec()
-		// returned, this will result in closed connection error
-		// on next read, breaking out of the read loop and
-		// allowing the run goroutine to exit.
-		_ = s.conn.Close()
-	}
 
 	if s.debugger != nil {
 		killProcess := s.config.Debugger.AttachPid == 0
@@ -272,7 +279,15 @@ func (s *Server) Stop() {
 	// The binary is no longer in use by the debugger. It is safe to remove it.
 	if s.binaryToRemove != "" {
 		gobuild.Remove(s.binaryToRemove)
-		s.binaryToRemove = ""
+	}
+	// Close client connection last, so other shutdown stages
+	// can send client notifications
+	if s.conn != nil {
+		// Unless Stop() was called after serveDAPCodec()
+		// returned, this will result in closed connection error
+		// on next read, breaking out of the read loop and
+		// allowing the run goroutine to exit.
+		_ = s.conn.Close()
 	}
 	s.log.Debug("DAP server stopped")
 }
@@ -343,18 +358,24 @@ func (s *Server) serveDAPCodec() {
 	s.reader = bufio.NewReader(s.conn)
 	for {
 		request, err := dap.ReadProtocolMessage(s.reader)
-		// TODO(polina): Differentiate between errors and handle them
-		// gracefully. For example,
+		// Handle dap.DecodeProtocolMessageFieldError errors gracefully by responding with an ErrorResponse.
+		// For example:
 		// -- "Request command 'foo' is not supported" means we
 		// potentially got some new DAP request that we do not yet have
 		// decoding support for, so we can respond with an ErrorResponse.
-		// TODO(polina): to support this add Seq to
-		// dap.DecodeProtocolMessageFieldError.
+		//
+		// Other errors, such as unmarshalling errors, will log the error and cause the server to trigger
+		// a stop.
 		if err != nil {
 			select {
 			case <-s.stopTriggered:
 			default:
 				if err != io.EOF {
+					if decodeErr, ok := err.(*dap.DecodeProtocolMessageFieldError); ok {
+						// Send an error response to the users if we were unable to process the message.
+						s.sendInternalErrorResponse(decodeErr.Seq, err.Error())
+						continue
+					}
 					s.log.Error("DAP error: ", err)
 				}
 				s.triggerServerStop()
@@ -1059,7 +1080,7 @@ func (s *Server) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 			continue
 		}
 		if _, ok := bpAdded[reqString]; ok {
-			err = fmt.Errorf("Breakpoint exists at %q, line: %d, column: %d", request.Arguments.Source.Path, want.Line, want.Column)
+			err = fmt.Errorf("breakpoint exists at %q, line: %d, column: %d", request.Arguments.Source.Path, want.Line, want.Column)
 		} else {
 			got.Cond = want.Condition
 			got.HitCond = want.HitCondition
@@ -1086,7 +1107,7 @@ func (s *Server) onSetBreakpointsRequest(request *dap.SetBreakpointsRequest) {
 		var got *api.Breakpoint
 		var err error
 		if _, ok := bpAdded[reqString]; ok {
-			err = fmt.Errorf("Breakpoint exists at %q, line: %d, column: %d", request.Arguments.Source.Path, want.Line, want.Column)
+			err = fmt.Errorf("breakpoint exists at %q, line: %d, column: %d", request.Arguments.Source.Path, want.Line, want.Column)
 		} else {
 			// Create new breakpoints.
 			got, err = s.debugger.CreateBreakpoint(
@@ -1154,7 +1175,7 @@ func (s *Server) onSetFunctionBreakpointsRequest(request *dap.SetFunctionBreakpo
 			continue
 		}
 		if _, ok := bpAdded[reqString]; ok {
-			err = fmt.Errorf("Breakpoint exists at function %q", want.Name)
+			err = fmt.Errorf("breakpoint exists at function %q", want.Name)
 		} else {
 			got.Cond = want.Condition
 			got.HitCond = want.HitCondition
@@ -1536,12 +1557,9 @@ func (s *Server) onStackTraceRequest(request *dap.StackTraceRequest) {
 	}
 
 	// Determine if the goroutine is a system goroutine.
-	// TODO(suzmue): Use the System() method defined in: https://github.com/go-delve/delve/pull/2504
-	g, err := s.debugger.FindGoroutine(goroutineID)
-	var isSystemGoroutine bool
-	if err == nil {
-		userLoc := g.UserCurrent()
-		isSystemGoroutine = fnPackageName(&userLoc) == "runtime"
+	isSystemGoroutine := true
+	if g, _ := s.debugger.FindGoroutine(goroutineID); g != nil {
+		isSystemGoroutine = g.System(s.debugger.Target())
 	}
 
 	stackFrames := make([]dap.StackFrame, len(frames))
@@ -1694,10 +1712,22 @@ func (s *Server) onVariablesRequest(request *dap.VariablesRequest) {
 		}
 	}
 
-	children, err := s.childrenToDAPVariables(v)
-	if err != nil {
-		s.sendErrorResponse(request.Request, UnableToLookupVariable, "Unable to lookup variable", err.Error())
-		return
+	var children []dap.Variable
+	if request.Arguments.Filter == "named" || request.Arguments.Filter == "" {
+		named, err := s.metadataToDAPVariables(v)
+		if err != nil {
+			s.sendErrorResponse(request.Request, UnableToLookupVariable, "Unable to lookup variable", err.Error())
+			return
+		}
+		children = append(children, named...)
+	}
+	if request.Arguments.Filter == "indexed" || request.Arguments.Filter == "" {
+		indexed, err := s.childrenToDAPVariables(v)
+		if err != nil {
+			s.sendErrorResponse(request.Request, UnableToLookupVariable, "Unable to lookup variable", err.Error())
+			return
+		}
+		children = append(children, indexed...)
 	}
 	response := &dap.VariablesResponse{
 		Response: *newResponse(request.Request),
@@ -1772,6 +1802,7 @@ func (s *Server) childrenToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variab
 					Value:              key,
 					VariablesReference: keyref,
 					IndexedVariables:   getIndexedVariableCount(keyv),
+					NamedVariables:     getNamedVariableCount(keyv),
 				}
 				valvar := dap.Variable{
 					Name:               fmt.Sprintf("[val %d]", v.startIndex+kvIndex),
@@ -1780,6 +1811,7 @@ func (s *Server) childrenToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variab
 					Value:              val,
 					VariablesReference: valref,
 					IndexedVariables:   getIndexedVariableCount(valv),
+					NamedVariables:     getNamedVariableCount(valv),
 				}
 				children = append(children, keyvar, valvar)
 			} else { // At least one is a scalar
@@ -1794,15 +1826,17 @@ func (s *Server) childrenToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variab
 					Value:        val,
 				}
 				if keyref != 0 { // key is a type to be expanded
-					if len(key) > DefaultLoadConfig.MaxStringLen {
+					if len(key) > maxMapKeyValueLen {
 						// Truncate and make unique
-						kvvar.Name = fmt.Sprintf("%s... @ %#x", key[0:DefaultLoadConfig.MaxStringLen], keyv.Addr)
+						kvvar.Name = fmt.Sprintf("%s... @ %#x", key[0:maxMapKeyValueLen], keyv.Addr)
 					}
 					kvvar.VariablesReference = keyref
 					kvvar.IndexedVariables = getIndexedVariableCount(keyv)
+					kvvar.NamedVariables = getNamedVariableCount(keyv)
 				} else if valref != 0 { // val is a type to be expanded
 					kvvar.VariablesReference = valref
 					kvvar.IndexedVariables = getIndexedVariableCount(valv)
+					kvvar.NamedVariables = getNamedVariableCount(valv)
 				}
 				children = append(children, kvvar)
 			}
@@ -1820,6 +1854,7 @@ func (s *Server) childrenToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variab
 				Value:              cvalue,
 				VariablesReference: cvarref,
 				IndexedVariables:   getIndexedVariableCount(&v.Children[i]),
+				NamedVariables:     getNamedVariableCount(&v.Children[i]),
 			}
 		}
 	default:
@@ -1859,10 +1894,57 @@ func (s *Server) childrenToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variab
 				Value:              cvalue,
 				VariablesReference: cvarref,
 				IndexedVariables:   getIndexedVariableCount(c),
+				NamedVariables:     getNamedVariableCount(c),
 			}
 		}
 	}
 	return children, nil
+}
+
+func getNamedVariableCount(v *proc.Variable) int {
+	namedVars := 0
+	if isListOfBytesOrRunes(v) {
+		// string value of array/slice of bytes and runes.
+		namedVars += 1
+	}
+	return namedVars
+}
+
+// metadataToDAPVariables returns the DAP presentation of the referenced variable's metadata.
+// These are included as named variables
+func (s *Server) metadataToDAPVariables(v *fullyQualifiedVariable) ([]dap.Variable, error) {
+	var children []dap.Variable
+
+	if isListOfBytesOrRunes(v.Variable) {
+		// Return the string value of []byte or []rune.
+		typeName := api.PrettyTypeName(v.DwarfType)
+		loadExpr := fmt.Sprintf("string(*(*%q)(%#x))", typeName, v.Addr)
+
+		s.log.Debugf("loading %s (type %s) with %s", v.fullyQualifiedNameOrExpr, typeName, loadExpr)
+		// We know that this is an array/slice of Uint8 or Int32, so we will load up to MaxStringLen.
+		config := DefaultLoadConfig
+		config.MaxArrayValues = config.MaxStringLen
+		vLoaded, err := s.debugger.EvalVariableInScope(-1, 0, 0, loadExpr, config)
+		val := s.convertVariableToString(vLoaded)
+		if err == nil {
+			// TODO(suzmue): Add evaluate name. Using string(name) will not get the same result because the
+			// MaxArrayValues is not auto adjusted in evaluate requests like MaxStringLen is adjusted.
+			children = append(children, dap.Variable{
+				Name:  "string()",
+				Value: val,
+				Type:  "string",
+			})
+		}
+	}
+	return children, nil
+}
+
+func isListOfBytesOrRunes(v *proc.Variable) bool {
+	if len(v.Children) > 0 && (v.Kind == reflect.Array || v.Kind == reflect.Slice) {
+		childKind := v.Children[0].RealType.Common().ReflectKind
+		return childKind == reflect.Uint8 || childKind == reflect.Int32
+	}
+	return false
 }
 
 func (s *Server) getTypeIfSupported(v *proc.Variable) string {
@@ -1890,9 +1972,12 @@ func (s *Server) convertVariableToString(v *proc.Variable) string {
 	return val
 }
 
-// defaultMaxValueLen is the max length of a string representation of a compound or reference
-// type variable.
-const defaultMaxValueLen = 1 << 8 // 256
+const (
+	// Limit the length of a string representation of a compound or reference type variable.
+	maxVarValueLen = 1 << 8 // 256
+	// Limit the length of an inlined map key.
+	maxMapKeyValueLen = 64
+)
 
 // Flags for convertVariableWithOpts option.
 type convertVariableFlags uint8
@@ -2048,8 +2133,8 @@ func (s *Server) convertVariableWithOpts(v *proc.Variable, qualifiedNameOrExpr s
 	// By default, only values of variables that have children can be truncated.
 	// If showFullValue is set, then all value strings are not truncated.
 	canTruncateValue := showFullValue&opts == 0
-	if len(value) > defaultMaxValueLen && canTruncateValue && canHaveRef {
-		value = value[:defaultMaxValueLen] + "..."
+	if len(value) > maxVarValueLen && canTruncateValue && canHaveRef {
+		value = value[:maxVarValueLen] + "..."
 	}
 	return value, variablesReference
 }
@@ -2113,9 +2198,9 @@ func (s *Server) onEvaluateRequest(request *dap.EvaluateRequest) {
 		case "repl", "variables", "hover", "clipboard":
 			if exprVar.Kind == reflect.String {
 				if strVal := constant.StringVal(exprVar.Value); exprVar.Len > int64(len(strVal)) {
-					// reload string value with a bigger limit.
+					// Reload the string value with a bigger limit.
 					loadCfg := DefaultLoadConfig
-					loadCfg.MaxStringLen = 4 << 10
+					loadCfg.MaxStringLen = maxSingleStringLen
 					if v, err := s.debugger.EvalVariableInScope(goid, frame, 0, request.Arguments.Expression, loadCfg); err != nil {
 						s.log.Debugf("Failed to load more for %v: %v", request.Arguments.Expression, err)
 					} else {
@@ -2131,7 +2216,7 @@ func (s *Server) onEvaluateRequest(request *dap.EvaluateRequest) {
 			opts |= showFullValue
 		}
 		exprVal, exprRef := s.convertVariableWithOpts(exprVar, fmt.Sprintf("(%s)", request.Arguments.Expression), opts)
-		response.Body = dap.EvaluateResponseBody{Result: exprVal, VariablesReference: exprRef, IndexedVariables: getIndexedVariableCount(exprVar)}
+		response.Body = dap.EvaluateResponseBody{Result: exprVal, VariablesReference: exprRef, IndexedVariables: getIndexedVariableCount(exprVar), NamedVariables: getNamedVariableCount(exprVar)}
 	}
 	s.send(response)
 }
@@ -2152,13 +2237,11 @@ func (s *Server) doCall(goid, frame int, expr string) (*api.DebuggerState, []*pr
 	}
 	// The return values of injected function calls are volatile.
 	// Load as much useful data as possible.
-	// - String: a common use case of call injection is to stringify complex
-	// data conveniently. That can easily exceed the default limit, 64.
 	// TODO: investigate whether we need to increase other limits. For example,
 	// the return value is a pointer to a temporary object, which can become
 	// invalid by other injected function calls. Do we care about such use cases?
 	loadCfg := DefaultLoadConfig
-	loadCfg.MaxStringLen = 1 << 10
+	loadCfg.MaxStringLen = maxStringLenInCallRetVars
 
 	// TODO(polina): since call will resume execution of all goroutines,
 	// we should do this asynchronously and send a continued event to the
@@ -2431,14 +2514,36 @@ func (s *Server) onExceptionInfoRequest(request *dap.ExceptionInfoRequest) {
 	if bpState != nil && bpState.Breakpoint != nil && (bpState.Breakpoint.Name == proc.FatalThrow || bpState.Breakpoint.Name == proc.UnrecoveredPanic) {
 		switch bpState.Breakpoint.Name {
 		case proc.FatalThrow:
-			// TODO(suzmue): add the fatal throw reason to body.Description.
 			body.ExceptionId = "fatal error"
+			// Attempt to get the value of the throw reason.
+			// This is not currently working for Go 1.16 or 1.17: https://github.com/golang/go/issues/46425.
+			handleError := func(err error) {
+				if err != nil {
+					body.Description = fmt.Sprintf("Error getting throw reason: %s", err.Error())
+				}
+				if goversion.ProducerAfterOrEqual(s.debugger.TargetGoVersion(), 1, 16) {
+					body.Description = "Throw reason unavailable, see https://github.com/golang/go/issues/46425"
+				}
+			}
+
+			exprVar, err := s.debugger.EvalVariableInScope(goroutineID, 1, 0, "s", DefaultLoadConfig)
+			if err == nil {
+				if exprVar.Value != nil {
+					body.Description = exprVar.Value.String()
+				} else {
+					handleError(exprVar.Unreadable)
+				}
+			} else {
+				handleError(err)
+			}
 		case proc.UnrecoveredPanic:
 			body.ExceptionId = "panic"
 			// Attempt to get the value of the panic message.
 			exprVar, err := s.debugger.EvalVariableInScope(goroutineID, 0, 0, "(*msgs).arg.(data)", DefaultLoadConfig)
 			if err == nil {
 				body.Description = exprVar.Value.String()
+			} else {
+				body.Description = fmt.Sprintf("Error getting panic message: %s", err.Error())
 			}
 		}
 	} else {
@@ -2467,7 +2572,7 @@ func (s *Server) onExceptionInfoRequest(request *dap.ExceptionInfoRequest) {
 	}
 
 	frames, err := s.debugger.Stacktrace(goroutineID, s.args.stackTraceDepth, 0)
-	if err == nil && len(frames) > 0 {
+	if err == nil {
 		apiFrames, err := s.debugger.ConvertStacktrace(frames, nil)
 		if err == nil {
 			var buf bytes.Buffer
@@ -2484,6 +2589,8 @@ func (s *Server) onExceptionInfoRequest(request *dap.ExceptionInfoRequest) {
 			})
 			body.Details.StackTrace = buf.String()
 		}
+	} else {
+		body.Details.StackTrace = fmt.Sprintf("Error getting stack trace: %s", err.Error())
 	}
 	response := &dap.ExceptionInfoResponse{
 		Response: *newResponse(request.Request),
@@ -2627,6 +2734,7 @@ func (s *Server) doRunCommand(command string, asyncSetupDone chan struct{}) {
 			if strings.HasPrefix(state.CurrentThread.Breakpoint.Name, functionBpPrefix) {
 				stopped.Body.Reason = "function breakpoint"
 			}
+			stopped.Body.HitBreakpointIds = []int{state.CurrentThread.Breakpoint.ID}
 		}
 	} else {
 		s.exceptionErr = err
