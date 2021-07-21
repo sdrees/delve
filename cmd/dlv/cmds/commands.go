@@ -182,6 +182,8 @@ to be launched or process to be attached to. The following modes are supported:
 - launch + exec (executes precompiled binary, like 'dlv exec')
 - launch + debug (builds and launches, like 'dlv debug')
 - launch + test (builds and tests, like 'dlv test')
+- launch + replay (replays an rr trace, like 'dlv replay')
+- launch + core (replays a core dump file, like 'dlv core')
 - attach + local (attaches to a running process, like 'dlv attach')
 The server does not yet accept multiple client connections (--accept-multiclient).
 While --continue is not supported, stopOnEntry launch/attach attribute can be used to control if
@@ -688,14 +690,14 @@ func connectCmd(cmd *cobra.Command, args []string) {
 }
 
 // waitForDisconnectSignal is a blocking function that waits for either
-// a SIGINT (Ctrl-C) signal from the OS or for disconnectChan to be closed
-// by the server when the client disconnects.
+// a SIGINT (Ctrl-C) or SIGTERM (kill -15) OS signal or for disconnectChan
+// to be closed by the server when the client disconnects.
 // Note that in headless mode, the debugged process is foregrounded
 // (to have control of the tty for debugging interactive programs),
 // so SIGINT gets sent to the debuggee and not to delve.
 func waitForDisconnectSignal(disconnectChan chan struct{}) {
 	ch := make(chan os.Signal, 1)
-	signal.Notify(ch, syscall.SIGINT)
+	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	if runtime.GOOS == "windows" {
 		// On windows Ctrl-C sent to inferior process is delivered
 		// as SIGINT to delve. Ignore it instead of stopping the server
